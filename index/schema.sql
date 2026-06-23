@@ -288,14 +288,15 @@ CREATE INDEX IF NOT EXISTS idx_finding_severity ON finding(severity);
 -- FTS5: полнотекстовый поиск по именам, summary, аннотациям
 -- (используется find_code_areas)
 -- ============================================================
+-- Regular (not contentless) FTS5 so columns are retrievable on match.
+-- entity_type / entity_id are stored UNINDEXED (returned but not tokenized).
 CREATE VIRTUAL TABLE IF NOT EXISTS search_index USING fts5(
-    entity_type,    -- class | method | endpoint | config_property
-    entity_id,
+    entity_type UNINDEXED,  -- class | method | endpoint
+    entity_id   UNINDEXED,
     name,
     fqn,
-    annotations,    -- пробел-разделённые имена аннотаций
-    summary,
-    content=''      -- внешний контент, не дублируем данные
+    annotations,            -- пробел-разделённые имена аннотаций
+    summary
 );
 
 -- ============================================================

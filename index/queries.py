@@ -43,6 +43,63 @@ def list_endpoints(
 
 
 # ------------------------------------------------------------
+# find_code_areas
+# ------------------------------------------------------------
+
+def find_code_areas(conn: sqlite3.Connection, query: str, limit: int = 20) -> dict:
+    """Keyword search over classes/methods/endpoints, grouped and enriched."""
+    from index import search as search_mod
+
+    # search each entity type separately so the 21k methods don't crowd out
+    # the (far fewer) classes and endpoints in the ranked window.
+    classes: list[dict] = []
+    for h in search_mod.search(conn, query, limit=limit, entity_type="class"):
+        row = conn.execute(
+            "SELECT fqn, simple_name, role, kind, file_path, line_start FROM class WHERE id = ?",
+            (h["entity_id"],),
+        ).fetchone()
+        if row:
+            d = dict(row)
+            d["module"] = _module_name(conn, h["entity_id"])
+            classes.append(d)
+
+    endpoints: list[dict] = []
+    for h in search_mod.search(conn, query, limit=limit, entity_type="endpoint"):
+        row = conn.execute(
+            "SELECT http_method, full_path, controller_fqn, handler_name FROM v_endpoint_full WHERE id = ?",
+            (h["entity_id"],),
+        ).fetchone()
+        if row:
+            endpoints.append(dict(row))
+
+    methods: list[dict] = []
+    for h in search_mod.search(conn, query, limit=limit, entity_type="method"):
+        row = conn.execute(
+            "SELECT m.name, m.signature, c.fqn AS class_fqn, m.line_start "
+            "FROM method m JOIN class c ON c.id = m.class_id WHERE m.id = ?",
+            (h["entity_id"],),
+        ).fetchone()
+        if row:
+            methods.append(dict(row))
+
+    return {
+        "query": query,
+        "counts": {"classes": len(classes), "endpoints": len(endpoints), "methods": len(methods)},
+        "classes": classes,
+        "endpoints": endpoints,
+        "methods": methods,
+    }
+
+
+def _module_name(conn: sqlite3.Connection, class_id: int) -> str | None:
+    row = conn.execute(
+        "SELECT mo.name FROM class cl LEFT JOIN module mo ON mo.id = cl.module_id WHERE cl.id = ?",
+        (class_id,),
+    ).fetchone()
+    return row["name"] if row else None
+
+
+# ------------------------------------------------------------
 # get_module_map
 # ------------------------------------------------------------
 

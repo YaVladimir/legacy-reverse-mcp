@@ -8,6 +8,7 @@ findings -> scan manifest.
 from __future__ import annotations
 
 from index import repository as repo
+from index.search import build_search_index
 from scanner.dependency_scanner import index_dependencies
 from scanner.java_indexer import index_class_dependencies, index_repo
 from scanner.repo_scanner import scan_repo
@@ -57,6 +58,10 @@ def build_index(conn, repo_path: str, progress=None, progress_every: int = 0) ->
     package_summaries = generate_package_summaries(conn)
     echo(f"Summarized {class_summaries} class(es), {package_summaries} package(s).")
 
+    echo("Building search index ...")
+    search_rows = build_search_index(conn)
+    echo(f"Indexed {search_rows} searchable entit(ies).")
+
     conn.execute(
         "INSERT INTO scan_manifest (repo_path, build_tool, total_files, total_classes, total_endpoints) "
         "VALUES (?, ?, ?, ?, ?)",
@@ -76,5 +81,6 @@ def build_index(conn, repo_path: str, progress=None, progress_every: int = 0) ->
         "external_deps": dep_stats.external_deps,
         "class_summaries": class_summaries,
         "package_summaries": package_summaries,
+        "search_rows": search_rows,
         "parse_failures": stats.files_failed,
     }

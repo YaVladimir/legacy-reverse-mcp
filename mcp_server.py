@@ -111,8 +111,13 @@ def get_project_overview() -> dict:
 
 
 @mcp.tool()
-def find_code_areas(query: str) -> dict:
-    raise NotImplementedError
+def find_code_areas(query: str, limit: int = 20) -> dict:
+    """Keyword search over classes, methods and endpoints, grouped by kind."""
+    conn = _read_conn()
+    try:
+        return queries.find_code_areas(conn, query, limit)
+    finally:
+        conn.close()
 
 
 @mcp.tool()
