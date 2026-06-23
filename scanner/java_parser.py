@@ -34,6 +34,7 @@ _VISIBILITY_KEYWORDS = ("public", "private", "protected")
 class ParsedAnnotation:
     name: str                      # with leading '@', e.g. "@Path"
     attributes: str | None = None  # raw argument list, e.g. '("/v1/glaccounts")'
+    line: int | None = None        # 1-based source line of the annotation
 
 
 @dataclass
@@ -44,6 +45,15 @@ class ParsedParameter:
 
 
 @dataclass
+class ParsedCall:
+    """A method invocation seen syntactically inside a method body."""
+
+    name: str                       # callee method name, e.g. "create"
+    receiver: str | None = None     # last identifier of the receiver, e.g. "depositService"; None = implicit this
+    line: int | None = None         # 1-based source line of the call
+
+
+@dataclass
 class ParsedField:
     name: str
     type_fqn: str | None
@@ -51,6 +61,7 @@ class ParsedField:
     is_static: bool = False
     is_final: bool = False
     is_injected: bool = False
+    line: int | None = None
     annotations: list[ParsedAnnotation] = field(default_factory=list)
 
 
@@ -66,6 +77,7 @@ class ParsedMethod:
     line_end: int | None = None
     annotations: list[ParsedAnnotation] = field(default_factory=list)
     parameters: list[ParsedParameter] = field(default_factory=list)
+    calls: list[ParsedCall] = field(default_factory=list)
 
 
 @dataclass
@@ -75,6 +87,7 @@ class ParsedClass:
     kind: str
     package: str | None
     file_path: str
+    package_line: int | None = None
     line_start: int | None = None
     line_end: int | None = None
     is_abstract: bool = False
@@ -117,7 +130,7 @@ def _collect_annotations(modifiers: Node | None) -> list[ParsedAnnotation]:
                 next((c for c in child.children if c.type == "identifier"), None)
             )
             if name:
-                out.append(ParsedAnnotation(name=f"@{name}"))
+                out.append(ParsedAnnotation(name=f"@{name}", line=child.start_point[0] + 1))
         elif child.type == "annotation":
             name = _text(child.child_by_field_name("name")) or _text(
                 next((c for c in child.children if c.type == "identifier"), None)
@@ -126,7 +139,11 @@ def _collect_annotations(modifiers: Node | None) -> list[ParsedAnnotation]:
                 (c for c in child.children if c.type == "annotation_argument_list"), None
             )
             if name:
-                out.append(ParsedAnnotation(name=f"@{name}", attributes=_text(args)))
+                out.append(
+                    ParsedAnnotation(
+                        name=f"@{name}", attributes=_text(args), line=child.start_point[0] + 1
+                    )
+                )
     return out
 
 
@@ -157,6 +174,7 @@ def _parse_field(decl: Node) -> list[ParsedField]:
     visibility = _visibility(modifiers)
     is_static = _has_modifier(modifiers, "static")
     is_final = _has_modifier(modifiers, "final")
+    line = decl.start_point[0] + 1
     ann_names = {a.name for a in annotations}
     # baseline: explicit injection annotations. Constructor-injection (Lombok
     # @RequiredArgsConstructor over final fields) needs class context and is
@@ -175,6 +193,7 @@ def _parse_field(decl: Node) -> list[ParsedField]:
                     is_static=is_static,
                     is_final=is_final,
                     is_injected=is_injected,
+                    line=line,
                     annotations=annotations,
                 )
             )
@@ -203,6 +222,40 @@ def _parse_parameters(method: Node) -> list[ParsedParameter]:
     return out
 
 
+def _receiver_name(obj: Node | None) -> str | None:
+    """Last identifier of a call receiver: ``depositService`` from ``this.depositService``."""
+    if obj is None:
+        return None
+    if obj.type == "identifier":
+        return _text(obj)
+    if obj.type == "this":
+        return "this"
+    if obj.type == "field_access":
+        fld = obj.child_by_field_name("field")
+        return _text(fld) if fld is not None else None
+    return None
+
+
+def _collect_calls(decl: Node) -> list[ParsedCall]:
+    """All method invocations inside a method body (syntactic; no type resolution)."""
+    out: list[ParsedCall] = []
+    stack = list(decl.children)
+    while stack:
+        node = stack.pop()
+        if node.type == "method_invocation":
+            name = _text(node.child_by_field_name("name"))
+            if name:
+                out.append(
+                    ParsedCall(
+                        name=name,
+                        receiver=_receiver_name(node.child_by_field_name("object")),
+                        line=node.start_point[0] + 1,
+                    )
+                )
+        stack.extend(node.children)
+    return out
+
+
 def _parse_method(decl: Node, class_name: str) -> ParsedMethod:
     modifiers = _modifiers_node(decl)
     is_constructor = decl.type == "constructor_declaration"
@@ -224,6 +277,7 @@ def _parse_method(decl: Node, class_name: str) -> ParsedMethod:
         line_end=decl.end_point[0] + 1,
         annotations=_collect_annotations(modifiers),
         parameters=params,
+        calls=_collect_calls(decl),
     )
 
 
@@ -258,7 +312,7 @@ def _class_body(decl: Node) -> Node | None:
 
 
 def _parse_type_declaration(
-    decl: Node, package: str | None, file_path: str
+    decl: Node, package: str | None, file_path: str, package_line: int | None = None
 ) -> ParsedClass:
     modifiers = _modifiers_node(decl)
     simple_name = _text(decl.child_by_field_name("name")) or "<anonymous>"
@@ -270,6 +324,7 @@ def _parse_type_declaration(
         kind=TYPE_DECLARATIONS.get(decl.type, "class"),
         package=package,
         file_path=file_path,
+        package_line=package_line,
         line_start=decl.start_point[0] + 1,
         line_end=decl.end_point[0] + 1,
         is_abstract=_has_modifier(modifiers, "abstract"),
@@ -294,12 +349,14 @@ def parse_source(source: bytes, file_path: str) -> ParsedFile:
     root = tree.root_node
 
     package = None
+    package_line: int | None = None
     imports: list[str] = []
     for node in root.children:
         if node.type == "package_declaration":
             # package_declaration -> "package" <scoped_identifier> ";"
             ident = next((c for c in node.children if c.is_named), None)
             package = _text(ident)
+            package_line = node.start_point[0] + 1
         elif node.type == "import_declaration":
             ident = next((c for c in node.children if c.is_named), None)
             if ident is not None and _text(ident):
@@ -309,7 +366,9 @@ def parse_source(source: bytes, file_path: str) -> ParsedFile:
     # type declarations can be nested under the program node directly
     for node in root.children:
         if node.type in TYPE_DECLARATIONS:
-            result.classes.append(_parse_type_declaration(node, package, file_path))
+            result.classes.append(
+                _parse_type_declaration(node, package, file_path, package_line)
+            )
     return result
 
 

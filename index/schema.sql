@@ -202,6 +202,24 @@ CREATE TABLE IF NOT EXISTS class_dependency (
 );
 
 -- ------------------------------------------------------------
+-- Синтаксические вызовы методов по полям класса (controller -> service -> repo)
+-- Только вызовы, receiver которых — поле класса (резолвится в receiver_field).
+-- ------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS method_call (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    caller_method_id  INTEGER NOT NULL REFERENCES method(id) ON DELETE CASCADE,
+    caller_class_id   INTEGER NOT NULL REFERENCES class(id) ON DELETE CASCADE,
+    callee_name       TEXT    NOT NULL,   -- имя вызываемого метода
+    receiver_field    TEXT,               -- поле, на котором сделан вызов
+    receiver_type_fqn TEXT,               -- тип этого поля, если известен
+    line              INTEGER
+);
+
+CREATE INDEX IF NOT EXISTS idx_method_call_caller ON method_call(caller_method_id);
+CREATE INDEX IF NOT EXISTS idx_method_call_class  ON method_call(caller_class_id);
+CREATE INDEX IF NOT EXISTS idx_method_call_rtype  ON method_call(receiver_type_fqn);
+
+-- ------------------------------------------------------------
 -- Зависимости между модулями (из Maven/Gradle)
 -- ------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS module_dependency (
@@ -283,6 +301,65 @@ CREATE TABLE IF NOT EXISTS finding (
 
 CREATE INDEX IF NOT EXISTS idx_finding_kind     ON finding(kind);
 CREATE INDEX IF NOT EXISTS idx_finding_severity ON finding(severity);
+
+-- ============================================================
+-- Слой доказуемости: observed facts / inferred findings / evidence / limitations
+-- ============================================================
+-- observed_facts  — прямые факты из исходников/конфигов/структуры (high by default)
+-- inferred_findings — эвристические выводы (всегда с evidence + confidence)
+-- evidence / limitations — полиморфно привязаны через (owner_type, owner_id),
+--   где owner_type ∈ {'observed_fact','inferred_finding'}.
+-- Таблица finding (выше) НЕ удалена — это отдельный слой структурных smell-ов.
+
+CREATE TABLE IF NOT EXISTS observed_facts (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    fact_type   TEXT NOT NULL,
+    subject     TEXT NOT NULL,
+    predicate   TEXT NOT NULL,
+    object      TEXT,
+    confidence  TEXT NOT NULL DEFAULT 'high',
+    created_at  TEXT DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_observed_facts_subject ON observed_facts(subject);
+CREATE INDEX IF NOT EXISTS idx_observed_facts_type    ON observed_facts(fact_type);
+
+CREATE TABLE IF NOT EXISTS inferred_findings (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    finding_type TEXT NOT NULL,
+    subject      TEXT NOT NULL,
+    summary      TEXT NOT NULL,
+    confidence   TEXT NOT NULL,
+    created_at   TEXT DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_inferred_findings_subject ON inferred_findings(subject);
+CREATE INDEX IF NOT EXISTS idx_inferred_findings_type    ON inferred_findings(finding_type);
+
+CREATE TABLE IF NOT EXISTS evidence (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    owner_type  TEXT NOT NULL,   -- 'observed_fact' | 'inferred_finding'
+    owner_id    INTEGER NOT NULL,
+    kind        TEXT NOT NULL,
+    description TEXT NOT NULL,
+    file_path   TEXT,
+    line_start  INTEGER,
+    line_end    INTEGER,
+    symbol      TEXT,
+    source      TEXT DEFAULT 'source'
+);
+
+CREATE INDEX IF NOT EXISTS idx_evidence_owner ON evidence(owner_type, owner_id);
+
+CREATE TABLE IF NOT EXISTS limitations (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    owner_type  TEXT NOT NULL,   -- 'observed_fact' | 'inferred_finding'
+    owner_id    INTEGER NOT NULL,
+    code        TEXT NOT NULL,
+    description TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_limitations_owner ON limitations(owner_type, owner_id);
 
 -- ============================================================
 -- FTS5: полнотекстовый поиск по именам, summary, аннотациям

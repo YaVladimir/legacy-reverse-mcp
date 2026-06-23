@@ -1,37 +1,65 @@
 # legacy-reverse-mcp
 
-An MCP server that **reverse-engineers legacy Java / Spring backends** so an agent
-can navigate an unfamiliar codebase: REST endpoints, Spring/JAX-RS layers,
-class roles, dependency-injection wiring and heuristic request traces.
+A **source-first** MCP server that helps a developer or an LLM agent understand a
+legacy **Java / Spring** backend fast: REST endpoints, Spring/JAX-RS layers, class
+roles, dependency-injection wiring, heuristic request traces, change impact and
+task-scoped context packs.
 
-Built around a static index (no compilation required): `tree-sitter-java`
-parses sources into SQLite, and MCP tools answer questions over that index.
+It parses sources with `tree-sitter-java` into a SQLite index (no compilation
+required) and answers questions over that index. It is **not** an exhaustive
+reverse-engineering suite and does **not** promise 100% accuracy. Instead, every
+heuristic answer **shows its work**: it separates *observed facts* from *inferred
+findings*, attaches *evidence* (file + line) to each, reports a *confidence*
+level, and lists the *limitations* that bound the answer.
 
-- **Language/stack:** Python 3.11+, [FastMCP](https://github.com/jlowin/fastmcp), SQLite, tree-sitter-java
-- **Frameworks understood:** Spring MVC (`@RestController`, `@GetMapping`, …) **and**
-  JAX-RS (`jakarta.ws.rs` `@Path`, `@GET`, …); Spring + Lombok constructor injection
+- **Stack:** Python 3.11+, [FastMCP](https://github.com/jlowin/fastmcp), SQLite, tree-sitter-java
+- **Frameworks:** Spring MVC (`@RestController`, `@GetMapping`, …) **and** JAX-RS
+  (`jakarta.ws.rs` `@Path`, `@GET`, …); Spring + Lombok constructor injection
   (`@RequiredArgsConstructor` over `final` fields)
+
+## What it can and cannot do
+
+**Can:** find endpoints; classify Spring/JAX-RS layers from stereotypes, naming and
+package; follow controller → service → repository using syntactic calls and the DI
+graph; estimate candidate change impact; assemble an explained context pack;
+produce a baseline project report.
+
+**Cannot** (by design — see [docs/limitations.md](docs/limitations.md)): bytecode
+analysis, runtime Spring resolution (proxies/profiles/conditional beans), a full
+polymorphic call graph, or data-flow analysis. False positives are possible; that
+is exactly why results carry confidence + evidence.
 
 ## Install
 
 ```bash
-python -m venv .venv
-.venv/Scripts/python -m pip install -e .   # Windows
-# source .venv/bin/activate && pip install -e .   # Unix
+py -m venv .venv
+.venv/Scripts/python -m pip install -e .          # Windows (use `py`/venv, not bare `python`)
+# source .venv/bin/activate && pip install -e .    # Unix
+# dev (tests): pip install -e ".[dev]"
 ```
 
 ## Scan a repository
 
 ```bash
-legacy-reverse scan --repo /path/to/java-project [--force] [--resolve]
+legacy-reverse scan --repo /path/to/java-project [--force] [--resolve] [--report]
 ```
 
-This walks the repo, detects Maven/Gradle modules, parses every non-test
-`.java` file, extracts the dependency graph (module→module and external
-artifacts) and writes an index to `<repo>/.reverse/index.sqlite3`.
-External versions are managed centrally (BOM) in many projects and are left
-`NULL` by the static parse; pass `--resolve` to run gradle and fill them in
-(slower, requires a working build).
+Walks the repo, detects Maven/Gradle modules, parses every non-test `.java` file,
+records **observed facts with evidence** and intra-class method calls, builds the
+dependency graph, and writes an index to `<repo>/.reverse/index.sqlite3`.
+`--report` also writes a [baseline report](docs/) (see below). `--resolve` runs
+gradle to fill external dependency versions (slower, needs a working build).
+
+## Baseline report
+
+```bash
+legacy-reverse scan --repo /path/to/java-project --report
+legacy-reverse report --repo /path/to/java-project   # from an existing index
+```
+
+Writes `baseline.md` + `baseline.json` to `<repo>/.reverse/reports/`: inventory
+counts, top modules/packages, public API surface, candidate domain areas,
+low-confidence findings and the tool's limitations.
 
 ## Run as an MCP server
 
@@ -39,55 +67,77 @@ External versions are managed centrally (BOM) in many projects and are left
 LEGACY_REVERSE_REPO=/path/to/java-project python mcp_server.py
 ```
 
-The server resolves its index from the repo passed to `scan_repository`, or
-from the `LEGACY_REVERSE_REPO` environment variable.
+The server resolves its index from the repo passed to `scan_repository`, or from
+the `LEGACY_REVERSE_REPO` environment variable.
 
 ## MCP tools
 
-| Tool | Status | Purpose |
-|------|--------|---------|
-| `scan_repository(repo_path, force)` | ✅ | Scan + (re)build the index |
-| `list_endpoints(http_method, path_contains, limit)` | ✅ | REST endpoints (JAX-RS + Spring) |
-| `explain_class(fqn)` | ✅ | Role, annotations, injected deps, methods, endpoints |
-| `trace_endpoint(endpoint_id)` | ✅ | Heuristic controller → service → repository/persistence chain |
-| `get_module_map()` | ✅ | Modules, inter-module deps, external coordinates, endpoint counts |
-| `get_project_overview()` | ✅ | Stack, totals, role distribution, top modules, findings |
-| `find_code_areas(query, limit)` | ✅ | FTS keyword search over classes/methods/endpoints |
-| `get_change_impact(symbol)` | ✅ | Direct dependents, affected endpoints, test candidates |
-| `generate_context_pack(task, max_tokens)` | ✅ | Compact task-scoped context pack for an agent |
+Every heuristic tool returns a structured response carrying `confidence`,
+`limitations` and `warnings`; errors are structured (`error`, `kind`,
+`suggestions`). Full schemas + examples: [docs/mcp-api.md](docs/mcp-api.md).
+
+| Tool | Purpose |
+|------|---------|
+| `scan_repository(repo_path, force)` | Scan + (re)build the index |
+| `list_endpoints(http_method, path_contains, limit)` | REST endpoints (JAX-RS + Spring) |
+| `explain_class(fqn)` | Observed facts + inferred findings + related symbols, all with evidence |
+| `trace_endpoint(endpoint_id \| http_method, path_contains)` | Controller → service → repository trace with per-step + overall confidence |
+| `get_change_impact(symbol)` | `direct_impacts` vs `candidate_impacts`, each with reason/evidence/confidence |
+| `generate_context_pack(task, max_tokens, max_items)` | Explained pack: `selected_items` (with reasons) + `excluded_items` |
+| `get_module_map()` | Modules, inter-module deps, external coordinates, endpoint counts |
+| `get_project_overview()` | Stack, totals, role distribution, top modules, findings |
+| `find_code_areas(query, limit)` | FTS keyword search over classes/methods/endpoints |
+
+## Interpreting confidence
+
+- **high** — a direct fact or an inference over direct (unambiguous) links: a
+  stereotype annotation, an endpoint read from a mapping, a call found
+  syntactically in a method body.
+- **medium** — a heuristic inference from several signals: layer from name **and**
+  package, a service/repository found via injection + naming.
+- **low** — a guess from naming/package/keyword similarity only.
+- **unknown** — no usable signal.
+
+Details + examples: [docs/confidence-model.md](docs/confidence-model.md). The
+observed-fact vs inferred-finding model: [docs/evidence-model.md](docs/evidence-model.md).
+
+## Golden questions (evaluation)
+
+```bash
+py eval/run_golden_questions.py          # markdown report; exit 0 only if all pass
+py eval/run_golden_questions.py --json
+```
+
+A deterministic regression layer that scans a committed Java/Spring fixture and
+checks **structural quality gates** (evidence/confidence/limitations present,
+endpoints found, context pack non-empty). See [docs/golden-questions.md](docs/golden-questions.md).
+
+## Tests
+
+```bash
+.venv/Scripts/python -m pytest -q
+```
 
 ## Layout
 
 ```
-cli.py                  legacy-reverse CLI (scan)
+cli.py                  CLI: scan (+ --report), report
 mcp_server.py           FastMCP server + tool registrations
-scanner/
-  repo_scanner.py       module detection (Maven/Gradle), file walking
-  java_parser.py        tree-sitter-java AST -> classes/methods/fields/annotations
-  spring_scanner.py     role classification + injection detection (pure)
-  endpoint_scanner.py   JAX-RS + Spring endpoint extraction (pure)
-  dependency_scanner.py module/external dependency graph (static + optional gradle)
-  java_indexer.py       orchestration: parse -> persist, class-dependency edges
-  pipeline.py           single scan pipeline shared by CLI and MCP
-index/
-  schema.sql            SQLite schema (+ FTS5 search_index)
-  repository.py         CRUD
-  queries.py            read models for MCP tools
-  search.py             FTS5 build + query
-  findings.py           heuristic findings (circular deps, god classes, ...)
-summarizer/
-  class_summary.py      deterministic class summaries (LLM-pluggable seam)
-  package_summary.py    package summaries
-  context_pack.py       task-scoped context pack assembly
+models/evidence.py      Evidence / Confidence / Limitation / ObservedFact / InferredFinding
+scanner/                repo + java parser, spring/endpoint scanners, fact emitter, indexer, pipeline
+index/                  schema.sql, repository (CRUD + facts), queries, search, findings
+analysis/               evidence-based tools: explain, trace, impact, context_pack, layers, report
+summarizer/             deterministic class/package summaries
+eval/                   golden_questions.yaml, run_golden_questions.py, fixture/
+tests/                  pytest suite
+docs/                   mcp-api, confidence-model, evidence-model, limitations, golden-questions
 ```
 
 ## Status
 
-All 5 phases are implemented and verified against
-[Apache Fineract](https://github.com/apache/fineract) (47 Gradle modules,
-~5.3k non-test classes): **974 endpoints** (971 JAX-RS + 3 Spring), roles
-classified (170 controllers / 810 services / 280 entities), constructor-injection
-traces reaching the persistence layer, a **147-edge module graph**, **16.5k
-class-dependency edges**, deterministic summaries, a **28k-entity FTS index**,
-and heuristic findings. All **9 MCP tools** are operational. Summaries are
-deterministic for now; the `summarize_class` seam allows swapping in an LLM later.
+Verified against [Apache Fineract](https://github.com/apache/fineract) (47 Gradle
+modules, ~5.3k non-test classes): **974 endpoints** (971 JAX-RS + 3 Spring), roles
+classified, constructor-injection traces reaching persistence, a 147-edge module
+graph, 16.5k class-dependency edges, **~48k observed facts with evidence**,
+intra-class call edges, FTS index, baseline report and a green golden-questions
+run. See [CHANGELOG.md](CHANGELOG.md) for the evidence-layer work.

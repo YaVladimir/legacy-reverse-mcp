@@ -15,7 +15,8 @@ from fastmcp import FastMCP
 
 from index import queries
 from index.repository import get_conn, init_db
-from index.queries import class_detail
+from analysis.common import meta
+from analysis.explain import explain_class as _explain_class
 from scanner.pipeline import build_index
 
 mcp = FastMCP("legacy-reverse-mcp")
@@ -76,33 +77,40 @@ def list_endpoints(http_method: str | None = None, path_contains: str | None = N
         rows = queries.list_endpoints(conn, http_method, path_contains, limit)
     finally:
         conn.close()
-    return {"count": len(rows), "endpoints": rows}
+    return meta(
+        {"count": len(rows), "endpoints": rows},
+        confidence="high",  # endpoints are read directly from mapping annotations
+        limitation_codes=["dynamic_endpoints"],
+    )
 
 
 @mcp.tool()
 def explain_class(fqn: str) -> dict:
-    """Explain a class: role, annotations, injected deps, methods, endpoints. Accepts FQN or simple name."""
+    """Explain a class as observed facts + inferred findings (each with evidence,
+    confidence) + related symbols + limitations. Accepts FQN or simple name."""
     conn = _read_conn()
     try:
-        detail = class_detail(conn, fqn)
+        return _explain_class(conn, fqn)
     finally:
         conn.close()
-    if detail is None:
-        return {"error": f"class not found: {fqn}"}
-    return detail
 
 
 @mcp.tool()
-def trace_endpoint(endpoint_id: int) -> dict:
-    """Heuristic controller -> service -> repository/persistence trace for an endpoint id."""
+def trace_endpoint(
+    endpoint_id: int | None = None,
+    http_method: str | None = None,
+    path_contains: str | None = None,
+) -> dict:
+    """Honest controller -> service -> repository/persistence trace with per-step
+    + overall confidence, evidence and limitations. Look up by id, or by
+    http_method/path_contains. Structured error (with suggestions) if not found."""
+    from analysis.trace import trace_endpoint as _trace
+
     conn = _read_conn()
     try:
-        trace = queries.trace_endpoint(conn, endpoint_id)
+        return _trace(conn, endpoint_id, http_method, path_contains)
     finally:
         conn.close()
-    if trace is None:
-        return {"error": f"endpoint not found: {endpoint_id}"}
-    return trace
 
 
 @mcp.tool()
@@ -110,9 +118,10 @@ def get_project_overview() -> dict:
     """High-level overview: stack, totals, role distribution, top modules, findings."""
     conn = _read_conn()
     try:
-        return queries.project_overview(conn)
+        result = queries.project_overview(conn)
     finally:
         conn.close()
+    return meta(result, confidence="medium", limitation_codes=["spring_proxies", "no_call_graph"])
 
 
 @mcp.tool()
@@ -120,9 +129,10 @@ def find_code_areas(query: str, limit: int = 20) -> dict:
     """Keyword search over classes, methods and endpoints, grouped by kind."""
     conn = _read_conn()
     try:
-        return queries.find_code_areas(conn, query, limit)
+        result = queries.find_code_areas(conn, query, limit)
     finally:
         conn.close()
+    return meta(result, confidence="medium", limitation_codes=["ambiguous_simple_name"])
 
 
 @mcp.tool()
@@ -130,32 +140,35 @@ def get_module_map() -> dict:
     """Module graph: modules with inter-module deps, external coordinates, endpoint counts."""
     conn = _read_conn()
     try:
-        return queries.module_map(conn)
+        result = queries.module_map(conn)
     finally:
         conn.close()
+    return meta(result, confidence="high", limitation_codes=["external_types_unresolved"])
 
 
 @mcp.tool()
 def get_change_impact(symbol: str) -> dict:
-    """Impact of changing a class: direct dependents, affected endpoints, test candidates."""
+    """Candidate impact of changing a class, split into direct_impacts (direct
+    references) and candidate_impacts (heuristic: endpoints, test names). Each
+    impact has reason + evidence + confidence; also returns suggested files."""
+    from analysis.impact import change_impact as _impact
+
     conn = _read_conn()
     try:
-        impact = queries.change_impact(conn, symbol)
+        return _impact(conn, symbol)
     finally:
         conn.close()
-    if impact is None:
-        return {"error": f"symbol not found: {symbol}"}
-    return impact
 
 
 @mcp.tool()
-def generate_context_pack(task: str, max_tokens: int = 4000) -> dict:
-    """Compact, task-scoped context pack (endpoints + classes + module context)."""
-    from summarizer.context_pack import generate_context_pack as _gen
+def generate_context_pack(task: str, max_tokens: int = 8000, max_items: int = 20) -> dict:
+    """Explainable, task-scoped context pack: selected_items (each with reason,
+    confidence, evidence), excluded_items, a context_markdown and limitations."""
+    from analysis.context_pack import generate_context_pack as _gen
 
     conn = _read_conn()
     try:
-        return _gen(conn, task, max_tokens)
+        return _gen(conn, task, max_tokens, max_items)
     finally:
         conn.close()
 

@@ -14,6 +14,9 @@ dependencies = [
     "click>=8",
 ]
 
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
 [project.scripts]
 legacy-reverse = "cli:cli"
 
@@ -25,4 +28,8 @@ build-backend = "setuptools.build_meta"
 py-modules = ["cli", "mcp_server"]
 
 [tool.setuptools.packages.find]
-include = ["scanner*", "index*", "summarizer*"]
+include = ["scanner*", "index*", "summarizer*", "models*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

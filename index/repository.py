@@ -5,6 +5,8 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
+from models.evidence import Evidence, InferredFinding, Limitation, ObservedFact
+
 SCHEMA_PATH = Path(__file__).with_name("schema.sql")
 
 
@@ -253,6 +255,7 @@ def clear_class_members(conn: sqlite3.Connection, class_id: int, commit: bool = 
 
     method_annotation / method_parameter rows cascade from method via FK.
     """
+    conn.execute("DELETE FROM method_call WHERE caller_class_id = ?", (class_id,))
     conn.execute("DELETE FROM method WHERE class_id = ?", (class_id,))
     conn.execute("DELETE FROM field WHERE class_id = ?", (class_id,))
     conn.execute("DELETE FROM class_annotation WHERE class_id = ?", (class_id,))
@@ -341,6 +344,27 @@ def insert_class_dependency(
     )
     if commit:
         conn.commit()
+
+
+def insert_method_call(
+    conn: sqlite3.Connection,
+    caller_method_id: int,
+    caller_class_id: int,
+    callee_name: str,
+    receiver_field: str | None = None,
+    receiver_type_fqn: str | None = None,
+    line: int | None = None,
+    commit: bool = True,
+) -> int:
+    cur = conn.execute(
+        "INSERT INTO method_call "
+        "(caller_method_id, caller_class_id, callee_name, receiver_field, receiver_type_fqn, line) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (caller_method_id, caller_class_id, callee_name, receiver_field, receiver_type_fqn, line),
+    )
+    if commit:
+        conn.commit()
+    return cur.lastrowid
 
 
 def insert_field(
@@ -545,3 +569,196 @@ def insert_finding(
     if commit:
         conn.commit()
     return cur.lastrowid
+
+
+# ------------------------------------------------------------
+# provability layer: observed facts / inferred findings / evidence / limitations
+# ------------------------------------------------------------
+
+OWNER_OBSERVED_FACT = "observed_fact"
+OWNER_INFERRED_FINDING = "inferred_finding"
+
+
+def _insert_evidence(
+    conn: sqlite3.Connection, owner_type: str, owner_id: int, ev: Evidence
+) -> None:
+    conn.execute(
+        "INSERT INTO evidence "
+        "(owner_type, owner_id, kind, description, file_path, line_start, line_end, symbol, source) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            owner_type,
+            owner_id,
+            ev.kind,
+            ev.description,
+            ev.file_path,
+            ev.line_start,
+            ev.line_end,
+            ev.symbol,
+            ev.source,
+        ),
+    )
+
+
+def _insert_limitation(
+    conn: sqlite3.Connection, owner_type: str, owner_id: int, lim: Limitation
+) -> None:
+    conn.execute(
+        "INSERT INTO limitations (owner_type, owner_id, code, description) VALUES (?, ?, ?, ?)",
+        (owner_type, owner_id, lim.code, lim.description),
+    )
+
+
+def insert_observed_fact(
+    conn: sqlite3.Connection, fact: ObservedFact, commit: bool = True
+) -> int:
+    """Persist an ObservedFact and its evidence rows. Returns the new fact id."""
+    cur = conn.execute(
+        "INSERT INTO observed_facts (fact_type, subject, predicate, object, confidence) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (fact.fact_type, fact.subject, fact.predicate, fact.object, fact.confidence.value),
+    )
+    fact_id = cur.lastrowid
+    for ev in fact.evidence:
+        _insert_evidence(conn, OWNER_OBSERVED_FACT, fact_id, ev)
+    if commit:
+        conn.commit()
+    return fact_id
+
+
+def insert_inferred_finding(
+    conn: sqlite3.Connection, finding: InferredFinding, commit: bool = True
+) -> int:
+    """Persist an InferredFinding with its evidence + limitations. Returns the new id.
+
+    The pydantic model already guarantees at least one evidence item.
+    """
+    cur = conn.execute(
+        "INSERT INTO inferred_findings (finding_type, subject, summary, confidence) "
+        "VALUES (?, ?, ?, ?)",
+        (finding.finding_type, finding.subject, finding.summary, finding.confidence.value),
+    )
+    finding_id = cur.lastrowid
+    for ev in finding.evidence:
+        _insert_evidence(conn, OWNER_INFERRED_FINDING, finding_id, ev)
+    for lim in finding.limitations:
+        _insert_limitation(conn, OWNER_INFERRED_FINDING, finding_id, lim)
+    if commit:
+        conn.commit()
+    return finding_id
+
+
+def clear_observed_facts(conn: sqlite3.Connection, commit: bool = True) -> None:
+    conn.execute("DELETE FROM evidence WHERE owner_type = ?", (OWNER_OBSERVED_FACT,))
+    conn.execute("DELETE FROM limitations WHERE owner_type = ?", (OWNER_OBSERVED_FACT,))
+    conn.execute("DELETE FROM observed_facts")
+    if commit:
+        conn.commit()
+
+
+def clear_inferred_findings(conn: sqlite3.Connection, commit: bool = True) -> None:
+    conn.execute("DELETE FROM evidence WHERE owner_type = ?", (OWNER_INFERRED_FINDING,))
+    conn.execute("DELETE FROM limitations WHERE owner_type = ?", (OWNER_INFERRED_FINDING,))
+    conn.execute("DELETE FROM inferred_findings")
+    if commit:
+        conn.commit()
+
+
+def _evidence_for(conn: sqlite3.Connection, owner_type: str, owner_id: int) -> list[dict]:
+    return [
+        dict(r)
+        for r in conn.execute(
+            "SELECT kind, description, file_path, line_start, line_end, symbol, source "
+            "FROM evidence WHERE owner_type = ? AND owner_id = ? ORDER BY id",
+            (owner_type, owner_id),
+        )
+    ]
+
+
+def _limitations_for(conn: sqlite3.Connection, owner_type: str, owner_id: int) -> list[dict]:
+    return [
+        dict(r)
+        for r in conn.execute(
+            "SELECT code, description FROM limitations WHERE owner_type = ? AND owner_id = ? ORDER BY id",
+            (owner_type, owner_id),
+        )
+    ]
+
+
+def list_observed_facts(
+    conn: sqlite3.Connection,
+    subject: str | None = None,
+    fact_type: str | None = None,
+    limit: int = 500,
+) -> list[dict]:
+    """Read observed facts (each with its evidence) as plain dicts, newest-id first."""
+    query = "SELECT * FROM observed_facts WHERE 1=1"
+    params: list = []
+    if subject is not None:
+        query += " AND subject = ?"
+        params.append(subject)
+    if fact_type is not None:
+        query += " AND fact_type = ?"
+        params.append(fact_type)
+    query += " ORDER BY id LIMIT ?"
+    params.append(limit)
+
+    out: list[dict] = []
+    for r in conn.execute(query, params):
+        d = dict(r)
+        d["evidence"] = _evidence_for(conn, OWNER_OBSERVED_FACT, r["id"])
+        out.append(d)
+    return out
+
+
+def list_inferred_findings(
+    conn: sqlite3.Connection,
+    subject: str | None = None,
+    finding_type: str | None = None,
+    limit: int = 500,
+) -> list[dict]:
+    """Read inferred findings (each with evidence + limitations) as plain dicts."""
+    query = "SELECT * FROM inferred_findings WHERE 1=1"
+    params: list = []
+    if subject is not None:
+        query += " AND subject = ?"
+        params.append(subject)
+    if finding_type is not None:
+        query += " AND finding_type = ?"
+        params.append(finding_type)
+    query += " ORDER BY id LIMIT ?"
+    params.append(limit)
+
+    out: list[dict] = []
+    for r in conn.execute(query, params):
+        d = dict(r)
+        d["evidence"] = _evidence_for(conn, OWNER_INFERRED_FINDING, r["id"])
+        d["limitations"] = _limitations_for(conn, OWNER_INFERRED_FINDING, r["id"])
+        out.append(d)
+    return out
+
+
+def count_observed_facts(conn: sqlite3.Connection) -> int:
+    return conn.execute("SELECT COUNT(*) FROM observed_facts").fetchone()[0]
+
+
+def observed_facts_for_class(
+    conn: sqlite3.Connection, fqn: str, limit: int = 1000
+) -> list[dict]:
+    """Facts about the class itself and its members (subjects ``fqn``, ``fqn#m``, ``fqn.f``).
+
+    Uses prefix matching via substr (not LIKE) so names with ``_`` don't over-match.
+    """
+    prefix_len = len(fqn) + 1
+    rows = conn.execute(
+        "SELECT * FROM observed_facts WHERE subject = ? "
+        "OR substr(subject, 1, ?) = ? OR substr(subject, 1, ?) = ? "
+        "ORDER BY id LIMIT ?",
+        (fqn, prefix_len, fqn + "#", prefix_len, fqn + ".", limit),
+    ).fetchall()
+    out: list[dict] = []
+    for r in rows:
+        d = dict(r)
+        d["evidence"] = _evidence_for(conn, OWNER_OBSERVED_FACT, r["id"])
+        out.append(d)
+    return out

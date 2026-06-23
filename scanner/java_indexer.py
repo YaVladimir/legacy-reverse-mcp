@@ -11,6 +11,7 @@ from pathlib import Path
 
 from index import repository as repo
 from scanner.endpoint_scanner import class_base_path, extract_endpoints, join_paths
+from scanner.fact_emitter import FactConfig, class_observed_facts, file_import_facts
 from scanner.java_parser import ParsedClass, parse_file
 from scanner.repo_scanner import IGNORED_DIRS
 from scanner.spring_scanner import (
@@ -28,11 +29,16 @@ class IndexStats:
     methods: int = 0
     fields: int = 0
     endpoints: int = 0
+    method_calls: int = 0
+    observed_facts: int = 0
     failures: list[tuple[str, str]] = dc_field(default_factory=list)
 
 
 def _normalize(p: str) -> str:
-    return p.replace("\\", "/").strip("/")
+    p = p.replace("\\", "/").strip("/")
+    # a root module path of "." is the catch-all; normalise it to "" so classes
+    # at the repo root resolve to it (otherwise single-module repos get module_id NULL).
+    return "" if p == "." else p
 
 
 def _build_module_lookup(conn) -> list[tuple[int, str]]:
@@ -70,7 +76,13 @@ def _iter_java_files(repo_root: Path, skip_tests: bool):
                 yield Path(dirpath) / name
 
 
-def _persist_class(conn, pc: ParsedClass, module_id: int | None, stats: IndexStats) -> None:
+def _persist_class(
+    conn,
+    pc: ParsedClass,
+    module_id: int | None,
+    stats: IndexStats,
+    fact_config: FactConfig | None = None,
+) -> None:
     package_id = None
     if pc.package:
         package_id = repo.insert_package(conn, fqn=pc.package, module_id=module_id, commit=False)
@@ -104,6 +116,9 @@ def _persist_class(conn, pc: ParsedClass, module_id: int | None, stats: IndexSta
     for iface in pc.interfaces:
         repo.insert_class_interface(conn, class_id, iface, commit=False)
 
+    # field name -> declared type, used to resolve call receivers (controller -> service)
+    field_types = {f.name: f.type_fqn for f in pc.fields}
+
     for m in pc.methods:
         method_id = repo.insert_method(
             conn,
@@ -123,6 +138,28 @@ def _persist_class(conn, pc: ParsedClass, module_id: int | None, stats: IndexSta
         for p in m.parameters:
             repo.insert_method_parameter(conn, method_id, p.position, p.name, p.type_fqn, commit=False)
         stats.methods += 1
+
+        # persist only calls whose receiver is a field of this class (deterministic,
+        # bounded): these are the controller->service->repository hops trace needs.
+        seen_calls: set[tuple[str, str]] = set()
+        for call in m.calls:
+            if call.receiver is None or call.receiver not in field_types:
+                continue
+            key = (call.receiver, call.name)
+            if key in seen_calls:
+                continue
+            seen_calls.add(key)
+            repo.insert_method_call(
+                conn,
+                caller_method_id=method_id,
+                caller_class_id=class_id,
+                callee_name=call.name,
+                receiver_field=call.receiver,
+                receiver_type_fqn=field_types[call.receiver],
+                line=call.line,
+                commit=False,
+            )
+            stats.method_calls += 1
 
         for ep in extract_endpoints([(a.name, a.attributes) for a in m.annotations]):
             repo.insert_endpoint(
@@ -161,13 +198,32 @@ def _persist_class(conn, pc: ParsedClass, module_id: int | None, stats: IndexSta
         )
         stats.fields += 1
 
+    # observed facts (Stage 3): direct, high-confidence facts with evidence.
+    if fact_config is not None:
+        for fact in class_observed_facts(pc, fact_config):
+            repo.insert_observed_fact(conn, fact, commit=False)
+            stats.observed_facts += 1
+
     stats.classes += 1
 
 
-def index_repo(conn, repo_path: str, skip_tests: bool = True, progress_every: int = 0) -> IndexStats:
+def index_repo(
+    conn,
+    repo_path: str,
+    skip_tests: bool = True,
+    progress_every: int = 0,
+    emit_facts: bool = True,
+    fact_config: FactConfig | None = None,
+) -> IndexStats:
     repo_root = Path(repo_path).resolve()
     lookup = _build_module_lookup(conn)
     stats = IndexStats()
+
+    # Stage 3: record observed facts by default. ``None`` disables emission so the
+    # member-only index can still be built (e.g. for fast/legacy callers).
+    fact_config = fact_config if fact_config is not None else (FactConfig() if emit_facts else None)
+    if fact_config is not None:
+        repo.clear_observed_facts(conn, commit=False)
 
     for java_file in _iter_java_files(repo_root, skip_tests):
         rel = java_file.relative_to(repo_root)
@@ -180,7 +236,12 @@ def index_repo(conn, repo_path: str, skip_tests: bool = True, progress_every: in
             continue
 
         for pc in parsed.classes:
-            _persist_class(conn, pc, module_id, stats)
+            _persist_class(conn, pc, module_id, stats, fact_config)
+
+        if fact_config is not None:
+            for fact in file_import_facts(parsed, fact_config):
+                repo.insert_observed_fact(conn, fact, commit=False)
+                stats.observed_facts += 1
 
         conn.commit()  # one commit per file
         stats.files_parsed += 1

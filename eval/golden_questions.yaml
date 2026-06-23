@@ -1,0 +1,77 @@
+# Golden questions for legacy-reverse-mcp.
+#
+# These do NOT check for "perfect text". They check STRUCTURAL quality signals:
+# the tool returns evidence, confidence and limitations; endpoints are found;
+# the context pack is non-empty; impacts are split; etc. Run with:
+#   py eval/run_golden_questions.py            (text/markdown report)
+#   py eval/run_golden_questions.py --json     (machine-readable)
+
+questions:
+  - id: project-overview
+    question: "Какие слои (controller/service/repository/entity) есть в проекте?"
+    tool: get_project_overview
+    expected_contains: ["controller", "service", "repository", "entity"]
+
+  - id: module-map
+    question: "Какие основные модули есть в проекте?"
+    tool: get_module_map
+    items_field: modules
+    expected_min_items: 1
+
+  - id: list-endpoints
+    question: "Какие REST endpoint-ы доступны?"
+    tool: list_endpoints
+    items_field: endpoints
+    expected_min_items: 1
+
+  - id: find-code-areas
+    question: "Где код, связанный с депозитами?"
+    tool: find_code_areas
+    input:
+      query: "deposit"
+    items_field: classes
+    expected_min_items: 1
+
+  - id: explain-controller
+    question: "Что делает DepositController и на чём это основано?"
+    tool: explain_class
+    input:
+      class: "DepositController"
+    expected_fields: ["observed_facts", "inferred_findings", "related_symbols", "limitations"]
+    gates: ["findings_have_evidence", "has_limitations"]
+
+  - id: trace-create-endpoint
+    question: "Какой путь от endpoint создания сущности до service/repository?"
+    tool: trace_endpoint
+    input:
+      method: "POST"
+      path_contains: "create"
+    expected_fields: ["trace", "confidence", "limitations"]
+    gates: ["steps_have_evidence", "has_confidence", "has_limitations"]
+
+  - id: trace-get-endpoint
+    question: "Куда ведёт GET endpoint депозитов?"
+    tool: trace_endpoint
+    input:
+      method: "GET"
+      path_contains: "deposits"
+    expected_fields: ["trace", "confidence", "limitations"]
+    gates: ["steps_have_evidence"]
+
+  - id: change-impact-service
+    question: "Что может затронуть изменение DepositService?"
+    tool: get_change_impact
+    input:
+      symbol: "DepositService"
+    expected_fields: ["direct_impacts", "candidate_impacts", "suggested_files_for_context", "limitations"]
+    gates: ["impacts_have_confidence"]
+
+  - id: context-pack
+    question: "Какой context pack нужен для изменения бизнес-правила создания депозита?"
+    tool: generate_context_pack
+    # NB: retrieval matches source identifiers (English), so a realistic task
+    # mentions the domain term — keyword search is deterministic, no translation.
+    input:
+      task: "изменить правило создания deposit (create)"
+    expected_fields: ["selected_items", "context_markdown", "limitations"]
+    gates: ["pack_not_empty", "selected_items_have_reason"]

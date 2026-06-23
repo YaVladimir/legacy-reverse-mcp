@@ -40,6 +40,10 @@ def build_index(conn, repo_path: str, progress=None, progress_every: int = 0) ->
         f"Indexed {stats.classes} class(es), {stats.methods} method(s), "
         f"{stats.fields} field(s), {stats.endpoints} endpoint(s) from {stats.files_parsed} file(s)."
     )
+    echo(
+        f"Recorded {stats.observed_facts} observed fact(s) with evidence, "
+        f"{stats.method_calls} intra-class method call(s)."
+    )
     if stats.files_failed:
         echo(f"  ! {stats.files_failed} file(s) failed to parse.")
 
@@ -81,6 +85,8 @@ def build_index(conn, repo_path: str, progress=None, progress_every: int = 0) ->
         "methods": stats.methods,
         "fields": stats.fields,
         "endpoints": stats.endpoints,
+        "observed_facts": stats.observed_facts,
+        "method_calls": stats.method_calls,
         "class_edges": class_edges,
         "module_edges": dep_stats.module_edges,
         "external_deps": dep_stats.external_deps,
