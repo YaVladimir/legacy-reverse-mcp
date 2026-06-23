@@ -11,6 +11,8 @@ from index import repository as repo
 from scanner.dependency_scanner import index_dependencies
 from scanner.java_indexer import index_class_dependencies, index_repo
 from scanner.repo_scanner import scan_repo
+from summarizer.class_summary import generate_class_summaries
+from summarizer.package_summary import generate_package_summaries
 
 
 def _noop(_msg: str) -> None:
@@ -50,6 +52,11 @@ def build_index(conn, repo_path: str, progress=None, progress_every: int = 0) ->
         f"{dep_stats.external_deps} external dependency declaration(s)."
     )
 
+    echo("Generating summaries ...")
+    class_summaries = generate_class_summaries(conn)
+    package_summaries = generate_package_summaries(conn)
+    echo(f"Summarized {class_summaries} class(es), {package_summaries} package(s).")
+
     conn.execute(
         "INSERT INTO scan_manifest (repo_path, build_tool, total_files, total_classes, total_endpoints) "
         "VALUES (?, ?, ?, ?, ?)",
@@ -67,5 +74,7 @@ def build_index(conn, repo_path: str, progress=None, progress_every: int = 0) ->
         "class_edges": class_edges,
         "module_edges": dep_stats.module_edges,
         "external_deps": dep_stats.external_deps,
+        "class_summaries": class_summaries,
+        "package_summaries": package_summaries,
         "parse_failures": stats.files_failed,
     }

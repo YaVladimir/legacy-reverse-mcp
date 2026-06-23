@@ -478,3 +478,40 @@ def insert_external_dependency(
 
 def list_module_dependencies(conn: sqlite3.Connection) -> list[sqlite3.Row]:
     return conn.execute("SELECT * FROM module_dependency").fetchall()
+
+
+# ------------------------------------------------------------
+# summaries
+# ------------------------------------------------------------
+
+def set_class_summary(conn: sqlite3.Connection, class_id: int, summary: str, commit: bool = True) -> None:
+    conn.execute("UPDATE class SET summary = ? WHERE id = ?", (summary, class_id))
+    if commit:
+        conn.commit()
+
+
+def insert_summary(
+    conn: sqlite3.Connection,
+    kind: str,
+    ref_id: int | None,
+    content: str,
+    model: str | None = None,
+    token_count: int | None = None,
+    commit: bool = True,
+) -> int:
+    cur = conn.execute(
+        "INSERT INTO summary (kind, ref_id, content, model, token_count) VALUES (?, ?, ?, ?, ?)",
+        (kind, ref_id, content, model, token_count),
+    )
+    if commit:
+        conn.commit()
+    return cur.lastrowid
+
+
+def clear_summaries(conn: sqlite3.Connection, kind: str | None = None, commit: bool = True) -> None:
+    if kind:
+        conn.execute("DELETE FROM summary WHERE kind = ?", (kind,))
+    else:
+        conn.execute("DELETE FROM summary")
+    if commit:
+        conn.commit()
