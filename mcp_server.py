@@ -1,15 +1,132 @@
-"""FastMCP server exposing legacy-reverse-mcp tools."""
+"""FastMCP server exposing legacy-reverse-mcp tools.
+
+DB resolution order for read tools:
+  1. the repo most recently passed to scan_repository in this process
+  2. the LEGACY_REVERSE_REPO environment variable
+The index lives at ``<repo>/.reverse/index.sqlite3``.
+"""
 
 from __future__ import annotations
 
+import os
+from pathlib import Path
+
 from fastmcp import FastMCP
 
+from index import queries
+from index.repository import get_conn, init_db, insert_module
+from index.queries import class_detail
+from scanner.java_indexer import index_repo
+from scanner.repo_scanner import scan_repo
+
 mcp = FastMCP("legacy-reverse-mcp")
+
+_DB_RELATIVE = Path(".reverse") / "index.sqlite3"
+_active_repo: Path | None = None
+
+
+def _resolve_repo() -> Path:
+    global _active_repo
+    if _active_repo is not None:
+        return _active_repo
+    env = os.environ.get("LEGACY_REVERSE_REPO")
+    if env:
+        return Path(env).resolve()
+    raise RuntimeError(
+        "No repository indexed. Call scan_repository(repo_path=...) first "
+        "or set LEGACY_REVERSE_REPO."
+    )
+
+
+def _db_path(repo: Path | None = None) -> Path:
+    repo = repo or _resolve_repo()
+    return repo / _DB_RELATIVE
+
+
+def _read_conn():
+    db = _db_path()
+    if not db.exists():
+        raise RuntimeError(f"Index not found at {db}. Run scan_repository first.")
+    return get_conn(db)
 
 
 @mcp.tool()
 def scan_repository(repo_path: str, force: bool = False) -> dict:
-    raise NotImplementedError
+    """Scan a Java/Spring repo and (re)build its .reverse index."""
+    global _active_repo
+    repo = Path(repo_path).resolve()
+    db = repo / _DB_RELATIVE
+    if db.exists() and not force:
+        _active_repo = repo
+        return {"status": "exists", "db_path": str(db), "hint": "pass force=true to rebuild"}
+    if db.exists():
+        db.unlink()
+
+    result = scan_repo(str(repo))
+    conn = init_db(db)
+    for m in result.modules:
+        insert_module(
+            conn, name=m.name, path=m.path, build_file=m.build_file,
+            group_id=m.group_id, artifact_id=m.artifact_id, version=m.version,
+            packaging=m.packaging,
+        )
+    stats = index_repo(conn, str(repo))
+    conn.execute(
+        "INSERT INTO scan_manifest (repo_path, build_tool, total_files, total_classes, total_endpoints) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (str(repo), result.build_tool, result.total_files, stats.classes, stats.endpoints),
+    )
+    conn.commit()
+    conn.close()
+    _active_repo = repo
+    return {
+        "status": "scanned",
+        "db_path": str(db),
+        "build_tool": result.build_tool,
+        "modules": len(result.modules),
+        "classes": stats.classes,
+        "methods": stats.methods,
+        "fields": stats.fields,
+        "endpoints": stats.endpoints,
+        "parse_failures": stats.files_failed,
+    }
+
+
+@mcp.tool()
+def list_endpoints(http_method: str | None = None, path_contains: str | None = None, limit: int = 200) -> dict:
+    """List REST endpoints (JAX-RS + Spring), optionally filtered by verb or path substring."""
+    conn = _read_conn()
+    try:
+        rows = queries.list_endpoints(conn, http_method, path_contains, limit)
+    finally:
+        conn.close()
+    return {"count": len(rows), "endpoints": rows}
+
+
+@mcp.tool()
+def explain_class(fqn: str) -> dict:
+    """Explain a class: role, annotations, injected deps, methods, endpoints. Accepts FQN or simple name."""
+    conn = _read_conn()
+    try:
+        detail = class_detail(conn, fqn)
+    finally:
+        conn.close()
+    if detail is None:
+        return {"error": f"class not found: {fqn}"}
+    return detail
+
+
+@mcp.tool()
+def trace_endpoint(endpoint_id: int) -> dict:
+    """Heuristic controller -> service -> repository/persistence trace for an endpoint id."""
+    conn = _read_conn()
+    try:
+        trace = queries.trace_endpoint(conn, endpoint_id)
+    finally:
+        conn.close()
+    if trace is None:
+        return {"error": f"endpoint not found: {endpoint_id}"}
+    return trace
 
 
 @mcp.tool()
@@ -24,21 +141,6 @@ def find_code_areas(query: str) -> dict:
 
 @mcp.tool()
 def get_module_map() -> dict:
-    raise NotImplementedError
-
-
-@mcp.tool()
-def list_endpoints() -> dict:
-    raise NotImplementedError
-
-
-@mcp.tool()
-def trace_endpoint(endpoint_id: int) -> dict:
-    raise NotImplementedError
-
-
-@mcp.tool()
-def explain_class(fqn: str) -> dict:
     raise NotImplementedError
 
 
