@@ -137,7 +137,15 @@ def get_module_map() -> dict:
 
 @mcp.tool()
 def get_change_impact(symbol: str) -> dict:
-    raise NotImplementedError
+    """Impact of changing a class: direct dependents, affected endpoints, test candidates."""
+    conn = _read_conn()
+    try:
+        impact = queries.change_impact(conn, symbol)
+    finally:
+        conn.close()
+    if impact is None:
+        return {"error": f"symbol not found: {symbol}"}
+    return impact
 
 
 @mcp.tool()

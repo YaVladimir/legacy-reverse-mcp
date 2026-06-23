@@ -166,6 +166,67 @@ def _module_name(conn: sqlite3.Connection, class_id: int) -> str | None:
 
 
 # ------------------------------------------------------------
+# get_change_impact
+# ------------------------------------------------------------
+
+def change_impact(conn: sqlite3.Connection, symbol: str, limit: int = 60) -> dict | None:
+    targets = conn.execute(
+        "SELECT id, fqn, simple_name, role, kind FROM class WHERE fqn = ? OR simple_name = ?",
+        (symbol, symbol),
+    ).fetchall()
+    if not targets:
+        return None
+    target_ids = [t["id"] for t in targets]
+    ph = ",".join("?" * len(target_ids))
+
+    # direct dependents (reverse class_dependency edges), with the via-kinds aggregated
+    dep_map: dict[int, dict] = {}
+    for r in conn.execute(
+        f"SELECT c.id, c.fqn, c.simple_name, c.role, cd.kind AS via "
+        f"FROM class_dependency cd JOIN class c ON c.id = cd.from_class_id "
+        f"WHERE cd.to_class_id IN ({ph}) AND c.id NOT IN ({ph})",
+        target_ids + target_ids,
+    ):
+        d = dep_map.setdefault(
+            r["id"], {"fqn": r["fqn"], "simple_name": r["simple_name"], "role": r["role"], "via": set()}
+        )
+        d["via"].add(r["via"])
+    dependents = sorted(dep_map.values(), key=lambda d: d["fqn"])[:limit]
+    for d in dependents:
+        d["via"] = sorted(d["via"])
+
+    # affected endpoints: those exposed by the symbol or any dependent controller
+    controller_ids = target_ids + list(dep_map.keys())
+    ph2 = ",".join("?" * len(controller_ids))
+    affected_endpoints = [
+        dict(r)
+        for r in conn.execute(
+            f"SELECT http_method, full_path, controller_fqn FROM v_endpoint_full "
+            f"WHERE id IN (SELECT id FROM endpoint WHERE controller_class_id IN ({ph2})) "
+            f"ORDER BY full_path LIMIT ?",
+            controller_ids + [limit],
+        )
+    ]
+
+    # heuristic test candidates (test sources are not indexed): likely class names
+    base_names = {t["simple_name"] for t in targets} | {d["simple_name"] for d in dependents}
+    test_candidates = sorted(
+        {f"{n}Test" for n in base_names} | {f"{n}IT" for n in base_names}
+    )[: limit]
+
+    return {
+        "symbol": symbol,
+        "resolved": [{"fqn": t["fqn"], "role": t["role"], "kind": t["kind"]} for t in targets],
+        "direct_dependents": dependents,
+        "dependent_count": len(dep_map),
+        "affected_endpoints": affected_endpoints,
+        "test_candidates": test_candidates,
+        "note": "test_candidates are heuristic (test sources are not indexed); "
+                "dependents derived from field/param/return/inheritance type references.",
+    }
+
+
+# ------------------------------------------------------------
 # get_module_map
 # ------------------------------------------------------------
 
