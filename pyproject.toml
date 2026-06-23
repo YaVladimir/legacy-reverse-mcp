@@ -4,12 +4,14 @@ version = "0.1.0"
 description = "Reverse-engineering MCP server for legacy Java/Spring backends"
 requires-python = ">=3.11"
 dependencies = [
-    "fastmcp",
-    "pydantic",
-    "pyyaml",
-    "tree-sitter",
-    "tree-sitter-java",
-    "click",
+    # fastmcp 3.x: @mcp.tool() returns the original function (see mcp_server.py)
+    "fastmcp>=3.4,<4",
+    "pydantic>=2,<3",
+    "pyyaml>=6",
+    # tree-sitter 0.25 API: Parser(Language(...)); set_language() removed
+    "tree-sitter>=0.25,<0.26",
+    "tree-sitter-java>=0.23,<0.24",
+    "click>=8",
 ]
 
 [project.scripts]
