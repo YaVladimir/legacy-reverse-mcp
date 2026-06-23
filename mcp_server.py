@@ -14,10 +14,9 @@ from pathlib import Path
 from fastmcp import FastMCP
 
 from index import queries
-from index.repository import get_conn, init_db, insert_module
+from index.repository import get_conn, init_db
 from index.queries import class_detail
-from scanner.java_indexer import index_repo
-from scanner.repo_scanner import scan_repo
+from scanner.pipeline import build_index
 
 mcp = FastMCP("legacy-reverse-mcp")
 
@@ -62,34 +61,11 @@ def scan_repository(repo_path: str, force: bool = False) -> dict:
     if db.exists():
         db.unlink()
 
-    result = scan_repo(str(repo))
     conn = init_db(db)
-    for m in result.modules:
-        insert_module(
-            conn, name=m.name, path=m.path, build_file=m.build_file,
-            group_id=m.group_id, artifact_id=m.artifact_id, version=m.version,
-            packaging=m.packaging,
-        )
-    stats = index_repo(conn, str(repo))
-    conn.execute(
-        "INSERT INTO scan_manifest (repo_path, build_tool, total_files, total_classes, total_endpoints) "
-        "VALUES (?, ?, ?, ?, ?)",
-        (str(repo), result.build_tool, result.total_files, stats.classes, stats.endpoints),
-    )
-    conn.commit()
+    summary = build_index(conn, str(repo))
     conn.close()
     _active_repo = repo
-    return {
-        "status": "scanned",
-        "db_path": str(db),
-        "build_tool": result.build_tool,
-        "modules": len(result.modules),
-        "classes": stats.classes,
-        "methods": stats.methods,
-        "fields": stats.fields,
-        "endpoints": stats.endpoints,
-        "parse_failures": stats.files_failed,
-    }
+    return {"status": "scanned", "db_path": str(db), **summary}
 
 
 @mcp.tool()

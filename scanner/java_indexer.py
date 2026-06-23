@@ -188,3 +188,55 @@ def index_repo(conn, repo_path: str, skip_tests: bool = True, progress_every: in
             print(f"  ... {stats.files_parsed} files, {stats.classes} classes")
 
     return stats
+
+
+def index_class_dependencies(conn) -> int:
+    """Post-pass: derive intra-project class->class edges from already-indexed data.
+
+    Resolves referenced type simple-names to class ids (external/unknown types are
+    skipped) and records edges in class_dependency. Over-approximates on ambiguous
+    simple-names (links all candidates) so change-impact never misses a dependent.
+    """
+    from index.queries import _simple_type  # local import: avoids import cycle at module load
+
+    repo.clear_class_dependencies(conn, commit=False)
+
+    name_to_ids: dict[str, list[int]] = {}
+    for r in conn.execute("SELECT id, simple_name FROM class"):
+        name_to_ids.setdefault(r["simple_name"], []).append(r["id"])
+
+    # collect references per class in a few bulk queries (not per-class)
+    refs: dict[int, list[tuple[str | None, str]]] = {}
+
+    def add(cid, simple, kind):
+        refs.setdefault(cid, []).append((simple, kind))
+
+    for r in conn.execute("SELECT id, superclass_fqn FROM class WHERE superclass_fqn IS NOT NULL"):
+        add(r["id"], _simple_type(r["superclass_fqn"]), "inheritance")
+    for r in conn.execute("SELECT class_id, interface_fqn FROM class_interface"):
+        add(r["class_id"], _simple_type(r["interface_fqn"]), "inheritance")
+    for r in conn.execute("SELECT class_id, type_fqn FROM field WHERE is_injected = 1"):
+        add(r["class_id"], _simple_type(r["type_fqn"]), "field_injection")
+    for r in conn.execute("SELECT class_id, return_type FROM method WHERE return_type IS NOT NULL"):
+        add(r["class_id"], _simple_type(r["return_type"]), "return_type")
+    for r in conn.execute(
+        "SELECT m.class_id AS class_id, mp.type_fqn AS t FROM method_parameter mp "
+        "JOIN method m ON m.id = mp.method_id WHERE mp.type_fqn IS NOT NULL"
+    ):
+        add(r["class_id"], _simple_type(r["t"]), "method_param")
+
+    edges = 0
+    for cid, ref_list in refs.items():
+        seen: set[tuple[int, str]] = set()
+        for simple, kind in ref_list:
+            if not simple:
+                continue
+            for tid in name_to_ids.get(simple, []):
+                if tid == cid or (tid, kind) in seen:
+                    continue
+                seen.add((tid, kind))
+                repo.insert_class_dependency(conn, cid, tid, kind, commit=False)
+                edges += 1
+
+    conn.commit()
+    return edges

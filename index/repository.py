@@ -321,6 +321,28 @@ def insert_method_parameter(
     return cur.lastrowid
 
 
+def clear_class_dependencies(conn: sqlite3.Connection, commit: bool = True) -> None:
+    conn.execute("DELETE FROM class_dependency")
+    if commit:
+        conn.commit()
+
+
+def insert_class_dependency(
+    conn: sqlite3.Connection,
+    from_class_id: int,
+    to_class_id: int,
+    kind: str = "unknown",
+    commit: bool = True,
+) -> None:
+    conn.execute(
+        "INSERT OR IGNORE INTO class_dependency (from_class_id, to_class_id, kind) "
+        "VALUES (?, ?, ?)",
+        (from_class_id, to_class_id, kind),
+    )
+    if commit:
+        conn.commit()
+
+
 def insert_field(
     conn: sqlite3.Connection,
     class_id: int,

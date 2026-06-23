@@ -6,10 +6,9 @@ from pathlib import Path
 
 import click
 
-from index.repository import init_db, insert_module
-from scanner.dependency_scanner import index_dependencies, resolve_versions_gradle
-from scanner.java_indexer import index_repo
-from scanner.repo_scanner import scan_repo
+from index.repository import init_db
+from scanner.dependency_scanner import resolve_versions_gradle
+from scanner.pipeline import build_index
 
 
 @click.group()
@@ -34,40 +33,8 @@ def scan(repo: str, force: bool, resolve: bool) -> None:
         db_path.unlink()
 
     click.echo(f"Scanning {repo_path} ...")
-    result = scan_repo(str(repo_path))
-
     conn = init_db(db_path)
-    for module in result.modules:
-        insert_module(
-            conn,
-            name=module.name,
-            path=module.path,
-            build_file=module.build_file,
-            group_id=module.group_id,
-            artifact_id=module.artifact_id,
-            version=module.version,
-            packaging=module.packaging,
-        )
-    click.echo(f"Found {len(result.modules)} module(s), {result.total_java_files} .java file(s).")
-
-    click.echo("Parsing Java sources ...")
-    stats = index_repo(conn, str(repo_path), progress_every=1000)
-    click.echo(
-        f"Indexed {stats.classes} class(es), {stats.methods} method(s), "
-        f"{stats.fields} field(s), {stats.endpoints} endpoint(s) from "
-        f"{stats.files_parsed} file(s)."
-    )
-    if stats.files_failed:
-        click.echo(f"  ⚠ {stats.files_failed} file(s) failed to parse.")
-
-    click.echo("Scanning dependencies ...")
-    dep_stats = index_dependencies(conn, str(repo_path))
-    click.echo(
-        f"Found {dep_stats.module_edges} inter-module edge(s), "
-        f"{dep_stats.external_deps} external dependency declaration(s)."
-    )
-    if dep_stats.unresolved_refs:
-        click.echo(f"  ⚠ {len(dep_stats.unresolved_refs)} unresolved project ref(s).")
+    build_index(conn, str(repo_path), progress=click.echo, progress_every=1000)
 
     if resolve:
         click.echo("Resolving versions via gradle (this can take a while) ...")
@@ -77,16 +44,7 @@ def scan(repo: str, force: bool, resolve: bool) -> None:
         else:
             click.echo(f"  resolve skipped: {res.get('reason')}")
 
-    conn.execute(
-        """
-        INSERT INTO scan_manifest (repo_path, build_tool, total_files, total_classes, total_endpoints)
-        VALUES (?, ?, ?, ?, ?)
-        """,
-        (str(repo_path), result.build_tool, result.total_files, stats.classes, stats.endpoints),
-    )
-    conn.commit()
     conn.close()
-
     click.echo(f"Index written to {db_path}")
 
 
