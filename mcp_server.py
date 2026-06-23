@@ -107,7 +107,12 @@ def trace_endpoint(endpoint_id: int) -> dict:
 
 @mcp.tool()
 def get_project_overview() -> dict:
-    raise NotImplementedError
+    """High-level overview: stack, totals, role distribution, top modules, findings."""
+    conn = _read_conn()
+    try:
+        return queries.project_overview(conn)
+    finally:
+        conn.close()
 
 
 @mcp.tool()

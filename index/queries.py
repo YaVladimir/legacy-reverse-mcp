@@ -43,6 +43,72 @@ def list_endpoints(
 
 
 # ------------------------------------------------------------
+# get_project_overview
+# ------------------------------------------------------------
+
+def project_overview(conn: sqlite3.Connection) -> dict:
+    manifest = conn.execute(
+        "SELECT * FROM scan_manifest ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+
+    roles = {r["role"]: r["n"] for r in conn.execute("SELECT role, COUNT(*) n FROM class GROUP BY role")}
+    endpoints_by_verb = {
+        r["http_method"]: r["n"]
+        for r in conn.execute("SELECT http_method, COUNT(*) n FROM endpoint GROUP BY http_method")
+    }
+
+    top_modules = [
+        {"name": r["name"], "classes": r["n"], "endpoints": r["ep"]}
+        for r in conn.execute(
+            "SELECT mo.name, COUNT(DISTINCT cl.id) n, "
+            "       COUNT(DISTINCT e.id) ep "
+            "FROM module mo "
+            "LEFT JOIN class cl ON cl.module_id = mo.id "
+            "LEFT JOIN endpoint e ON e.controller_class_id = cl.id "
+            "GROUP BY mo.id ORDER BY n DESC LIMIT 8"
+        )
+    ]
+
+    top_external = [
+        {"artifact": f"{r['group_id']}:{r['artifact_id']}", "used_by_modules": r["n"]}
+        for r in conn.execute(
+            "SELECT group_id, artifact_id, COUNT(DISTINCT module_id) n "
+            "FROM external_dependency GROUP BY group_id, artifact_id ORDER BY n DESC LIMIT 10"
+        )
+    ]
+
+    findings = {
+        r["kind"]: r["n"]
+        for r in conn.execute("SELECT kind, COUNT(*) n FROM finding GROUP BY kind")
+    }
+    sample_findings = [
+        {"kind": r["kind"], "severity": r["severity"], "description": r["description"]}
+        for r in conn.execute(
+            "SELECT kind, severity, description FROM finding "
+            "ORDER BY CASE severity WHEN 'error' THEN 0 WHEN 'warning' THEN 1 ELSE 2 END LIMIT 15"
+        )
+    ]
+
+    return {
+        "repo_path": manifest["repo_path"] if manifest else None,
+        "build_tool": manifest["build_tool"] if manifest else None,
+        "scanned_at": manifest["scanned_at"] if manifest else None,
+        "totals": {
+            "modules": conn.execute("SELECT COUNT(*) FROM module").fetchone()[0],
+            "classes": conn.execute("SELECT COUNT(*) FROM class").fetchone()[0],
+            "methods": conn.execute("SELECT COUNT(*) FROM method").fetchone()[0],
+            "endpoints": conn.execute("SELECT COUNT(*) FROM endpoint").fetchone()[0],
+        },
+        "roles": roles,
+        "endpoints_by_verb": endpoints_by_verb,
+        "top_modules": top_modules,
+        "top_external_dependencies": top_external,
+        "findings": findings,
+        "sample_findings": sample_findings,
+    }
+
+
+# ------------------------------------------------------------
 # find_code_areas
 # ------------------------------------------------------------
 

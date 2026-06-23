@@ -515,3 +515,33 @@ def clear_summaries(conn: sqlite3.Connection, kind: str | None = None, commit: b
         conn.execute("DELETE FROM summary")
     if commit:
         conn.commit()
+
+
+# ------------------------------------------------------------
+# findings
+# ------------------------------------------------------------
+
+def clear_findings(conn: sqlite3.Connection, commit: bool = True) -> None:
+    conn.execute("DELETE FROM finding")
+    if commit:
+        conn.commit()
+
+
+def insert_finding(
+    conn: sqlite3.Connection,
+    kind: str,
+    description: str,
+    severity: str = "info",
+    class_id: int | None = None,
+    method_id: int | None = None,
+    module_id: int | None = None,
+    commit: bool = True,
+) -> int:
+    cur = conn.execute(
+        "INSERT INTO finding (kind, severity, class_id, method_id, module_id, description) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (kind, severity, class_id, method_id, module_id, description),
+    )
+    if commit:
+        conn.commit()
+    return cur.lastrowid
