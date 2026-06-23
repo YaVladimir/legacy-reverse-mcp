@@ -23,11 +23,15 @@ python -m venv .venv
 ## Scan a repository
 
 ```bash
-legacy-reverse scan --repo /path/to/java-project [--force]
+legacy-reverse scan --repo /path/to/java-project [--force] [--resolve]
 ```
 
 This walks the repo, detects Maven/Gradle modules, parses every non-test
-`.java` file and writes an index to `<repo>/.reverse/index.sqlite3`.
+`.java` file, extracts the dependency graph (module→module and external
+artifacts) and writes an index to `<repo>/.reverse/index.sqlite3`.
+External versions are managed centrally (BOM) in many projects and are left
+`NULL` by the static parse; pass `--resolve` to run gradle and fill them in
+(slower, requires a working build).
 
 ## Run as an MCP server
 
@@ -46,9 +50,9 @@ from the `LEGACY_REVERSE_REPO` environment variable.
 | `list_endpoints(http_method, path_contains, limit)` | ✅ | REST endpoints (JAX-RS + Spring) |
 | `explain_class(fqn)` | ✅ | Role, annotations, injected deps, methods, endpoints |
 | `trace_endpoint(endpoint_id)` | ✅ | Heuristic controller → service → repository/persistence chain |
+| `get_module_map()` | ✅ | Modules, inter-module deps, external coordinates, endpoint counts |
 | `get_project_overview()` | 🚧 | Stack, modules, counts, suspicious deps |
 | `find_code_areas(query)` | 🚧 | Keyword search over classes/methods/summaries |
-| `get_module_map()` | 🚧 | Modules, inter-module deps, public endpoints |
 | `get_change_impact(symbol)` | 🚧 | Direct dependents, affected endpoints, test candidates |
 | `generate_context_pack(task, max_tokens)` | 🚧 | Compact task-scoped context for an agent |
 

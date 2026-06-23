@@ -43,6 +43,61 @@ def list_endpoints(
 
 
 # ------------------------------------------------------------
+# get_module_map
+# ------------------------------------------------------------
+
+def module_map(conn: sqlite3.Connection) -> dict:
+    """Modules with inter-module deps, external dep coordinates and endpoint counts."""
+    modules = conn.execute("SELECT id, name, path, build_file, packaging FROM module ORDER BY name").fetchall()
+
+    class_counts = {
+        r["module_id"]: r["n"]
+        for r in conn.execute("SELECT module_id, COUNT(*) n FROM class GROUP BY module_id")
+    }
+    endpoint_counts = {
+        r["module_id"]: r["n"]
+        for r in conn.execute(
+            "SELECT cl.module_id AS module_id, COUNT(*) n FROM endpoint e "
+            "JOIN class cl ON cl.id = e.controller_class_id GROUP BY cl.module_id"
+        )
+    }
+
+    depends_on: dict[int, list[str]] = {}
+    edges: list[list[str]] = []
+    for r in conn.execute(
+        "SELECT m1.id AS fid, m1.name AS fname, m2.name AS tname "
+        "FROM module_dependency md "
+        "JOIN module m1 ON m1.id = md.from_module_id "
+        "JOIN module m2 ON m2.id = md.to_module_id"
+    ):
+        depends_on.setdefault(r["fid"], []).append(r["tname"])
+        edges.append([r["fname"], r["tname"]])
+
+    external: dict[int, list[str]] = {}
+    for r in conn.execute(
+        "SELECT module_id, group_id, artifact_id FROM external_dependency"
+    ):
+        external.setdefault(r["module_id"], []).append(f"{r['group_id']}:{r['artifact_id']}")
+
+    out_modules = []
+    for m in modules:
+        out_modules.append(
+            {
+                "name": m["name"],
+                "path": m["path"],
+                "build_file": m["build_file"],
+                "packaging": m["packaging"],
+                "classes": class_counts.get(m["id"], 0),
+                "endpoints": endpoint_counts.get(m["id"], 0),
+                "depends_on": sorted(depends_on.get(m["id"], [])),
+                "external_deps": sorted(set(external.get(m["id"], []))),
+            }
+        )
+
+    return {"module_count": len(out_modules), "modules": out_modules, "edges": edges}
+
+
+# ------------------------------------------------------------
 # explain_class
 # ------------------------------------------------------------
 

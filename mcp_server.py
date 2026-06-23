@@ -141,7 +141,12 @@ def find_code_areas(query: str) -> dict:
 
 @mcp.tool()
 def get_module_map() -> dict:
-    raise NotImplementedError
+    """Module graph: modules with inter-module deps, external coordinates, endpoint counts."""
+    conn = _read_conn()
+    try:
+        return queries.module_map(conn)
+    finally:
+        conn.close()
 
 
 @mcp.tool()

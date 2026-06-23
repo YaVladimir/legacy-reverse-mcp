@@ -66,6 +66,14 @@ def list_modules(conn: sqlite3.Connection) -> list[sqlite3.Row]:
     return conn.execute("SELECT * FROM module ORDER BY name").fetchall()
 
 
+def module_by_path(conn: sqlite3.Connection, path: str) -> sqlite3.Row | None:
+    return conn.execute("SELECT * FROM module WHERE path = ?", (path,)).fetchone()
+
+
+def module_by_name(conn: sqlite3.Connection, name: str) -> sqlite3.Row | None:
+    return conn.execute("SELECT * FROM module WHERE name = ?", (name,)).fetchone()
+
+
 # ------------------------------------------------------------
 # package
 # ------------------------------------------------------------
@@ -398,3 +406,53 @@ def get_endpoint(conn: sqlite3.Connection, endpoint_id: int) -> sqlite3.Row | No
 
 def list_endpoints(conn: sqlite3.Connection) -> list[sqlite3.Row]:
     return conn.execute("SELECT * FROM v_endpoint_full ORDER BY full_path").fetchall()
+
+
+# ------------------------------------------------------------
+# dependencies (module -> module, module -> external artifact)
+# ------------------------------------------------------------
+
+def clear_dependencies(conn: sqlite3.Connection, commit: bool = True) -> None:
+    conn.execute("DELETE FROM module_dependency")
+    conn.execute("DELETE FROM external_dependency")
+    if commit:
+        conn.commit()
+
+
+def insert_module_dependency(
+    conn: sqlite3.Connection,
+    from_module_id: int,
+    to_module_id: int,
+    scope: str | None = None,
+    commit: bool = True,
+) -> None:
+    conn.execute(
+        "INSERT OR IGNORE INTO module_dependency (from_module_id, to_module_id, scope) "
+        "VALUES (?, ?, ?)",
+        (from_module_id, to_module_id, scope),
+    )
+    if commit:
+        conn.commit()
+
+
+def insert_external_dependency(
+    conn: sqlite3.Connection,
+    module_id: int | None,
+    group_id: str,
+    artifact_id: str,
+    version: str | None = None,
+    scope: str | None = None,
+    commit: bool = True,
+) -> int:
+    cur = conn.execute(
+        "INSERT INTO external_dependency (module_id, group_id, artifact_id, version, scope) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (module_id, group_id, artifact_id, version, scope),
+    )
+    if commit:
+        conn.commit()
+    return cur.lastrowid
+
+
+def list_module_dependencies(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    return conn.execute("SELECT * FROM module_dependency").fetchall()

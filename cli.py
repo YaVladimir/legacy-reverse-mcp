@@ -7,6 +7,7 @@ from pathlib import Path
 import click
 
 from index.repository import init_db, insert_module
+from scanner.dependency_scanner import index_dependencies, resolve_versions_gradle
 from scanner.java_indexer import index_repo
 from scanner.repo_scanner import scan_repo
 
@@ -19,7 +20,8 @@ def cli() -> None:
 @cli.command()
 @click.option("--repo", required=True, type=click.Path(exists=True, file_okay=False), help="Path to the repository to scan.")
 @click.option("--force", is_flag=True, default=False, help="Rebuild the index even if it already exists.")
-def scan(repo: str, force: bool) -> None:
+@click.option("--resolve", is_flag=True, default=False, help="Run gradle to resolve exact dependency versions (slow).")
+def scan(repo: str, force: bool, resolve: bool) -> None:
     """Scan a repository and build/update the .reverse index."""
     repo_path = Path(repo).resolve()
     db_path = repo_path / ".reverse" / "index.sqlite3"
@@ -57,6 +59,23 @@ def scan(repo: str, force: bool) -> None:
     )
     if stats.files_failed:
         click.echo(f"  ⚠ {stats.files_failed} file(s) failed to parse.")
+
+    click.echo("Scanning dependencies ...")
+    dep_stats = index_dependencies(conn, str(repo_path))
+    click.echo(
+        f"Found {dep_stats.module_edges} inter-module edge(s), "
+        f"{dep_stats.external_deps} external dependency declaration(s)."
+    )
+    if dep_stats.unresolved_refs:
+        click.echo(f"  ⚠ {len(dep_stats.unresolved_refs)} unresolved project ref(s).")
+
+    if resolve:
+        click.echo("Resolving versions via gradle (this can take a while) ...")
+        res = resolve_versions_gradle(conn, str(repo_path), progress=lambda n: None)
+        if res["status"] == "done":
+            click.echo(f"  versions updated: {res['versions_updated']}; failures: {len(res['failures'])}")
+        else:
+            click.echo(f"  resolve skipped: {res.get('reason')}")
 
     conn.execute(
         """
