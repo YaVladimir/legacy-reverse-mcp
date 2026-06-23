@@ -10,6 +10,7 @@ from dataclasses import dataclass, field as dc_field
 from pathlib import Path
 
 from index import repository as repo
+from scanner.endpoint_scanner import class_base_path, extract_endpoints, join_paths
 from scanner.java_parser import ParsedClass, parse_file
 from scanner.repo_scanner import IGNORED_DIRS
 from scanner.spring_scanner import (
@@ -26,6 +27,7 @@ class IndexStats:
     classes: int = 0
     methods: int = 0
     fields: int = 0
+    endpoints: int = 0
     failures: list[tuple[str, str]] = dc_field(default_factory=list)
 
 
@@ -76,6 +78,7 @@ def _persist_class(conn, pc: ParsedClass, module_id: int | None, stats: IndexSta
     class_ann_names = {a.name for a in pc.annotations}
     role = classify_role(class_ann_names, pc.simple_name, pc.kind)
     uses_ctor_di = class_uses_constructor_di(class_ann_names)
+    base_path = class_base_path([(a.name, a.attributes) for a in pc.annotations])
 
     class_id = repo.insert_class(
         conn,
@@ -120,6 +123,21 @@ def _persist_class(conn, pc: ParsedClass, module_id: int | None, stats: IndexSta
         for p in m.parameters:
             repo.insert_method_parameter(conn, method_id, p.position, p.name, p.type_fqn, commit=False)
         stats.methods += 1
+
+        for ep in extract_endpoints([(a.name, a.attributes) for a in m.annotations]):
+            repo.insert_endpoint(
+                conn,
+                http_method=ep.http_method,
+                path=ep.sub_path or "",
+                full_path=join_paths(base_path, ep.sub_path),
+                controller_class_id=class_id,
+                handler_method_id=method_id,
+                produces=ep.produces,
+                consumes=ep.consumes,
+                response_dto_fqn=m.return_type,
+                commit=False,
+            )
+            stats.endpoints += 1
 
     for f in pc.fields:
         field_ann_names = {a.name for a in f.annotations}

@@ -364,6 +364,7 @@ def insert_endpoint(
     request_dto_fqn: str | None = None,
     response_dto_fqn: str | None = None,
     deprecated: bool = False,
+    commit: bool = True,
 ) -> int:
     cur = conn.execute(
         """
@@ -386,7 +387,8 @@ def insert_endpoint(
             int(deprecated),
         ),
     )
-    conn.commit()
+    if commit:
+        conn.commit()
     return cur.lastrowid
 
 

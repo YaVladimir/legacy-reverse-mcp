@@ -52,7 +52,8 @@ def scan(repo: str, force: bool) -> None:
     stats = index_repo(conn, str(repo_path), progress_every=1000)
     click.echo(
         f"Indexed {stats.classes} class(es), {stats.methods} method(s), "
-        f"{stats.fields} field(s) from {stats.files_parsed} file(s)."
+        f"{stats.fields} field(s), {stats.endpoints} endpoint(s) from "
+        f"{stats.files_parsed} file(s)."
     )
     if stats.files_failed:
         click.echo(f"  ⚠ {stats.files_failed} file(s) failed to parse.")
@@ -60,9 +61,9 @@ def scan(repo: str, force: bool) -> None:
     conn.execute(
         """
         INSERT INTO scan_manifest (repo_path, build_tool, total_files, total_classes, total_endpoints)
-        VALUES (?, ?, ?, ?, 0)
+        VALUES (?, ?, ?, ?, ?)
         """,
-        (str(repo_path), result.build_tool, result.total_files, stats.classes),
+        (str(repo_path), result.build_tool, result.total_files, stats.classes, stats.endpoints),
     )
     conn.commit()
     conn.close()
