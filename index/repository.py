@@ -49,14 +49,13 @@ def insert_module(
             artifact_id = excluded.artifact_id,
             version = excluded.version,
             packaging = excluded.packaging
+        RETURNING id
         """,
         (name, path, build_file, group_id, artifact_id, version, packaging),
     )
+    module_id = cur.fetchone()["id"]
     conn.commit()
-    if cur.lastrowid:
-        return cur.lastrowid
-    row = conn.execute("SELECT id FROM module WHERE name = ?", (name,)).fetchone()
-    return row["id"]
+    return module_id
 
 
 def get_module(conn: sqlite3.Connection, module_id: int) -> sqlite3.Row | None:
@@ -72,21 +71,25 @@ def list_modules(conn: sqlite3.Connection) -> list[sqlite3.Row]:
 # ------------------------------------------------------------
 
 def insert_package(
-    conn: sqlite3.Connection, fqn: str, module_id: int | None = None, path: str | None = None
+    conn: sqlite3.Connection,
+    fqn: str,
+    module_id: int | None = None,
+    path: str | None = None,
+    commit: bool = True,
 ) -> int:
     cur = conn.execute(
         """
         INSERT INTO package (fqn, module_id, path)
         VALUES (?, ?, ?)
         ON CONFLICT(fqn) DO UPDATE SET module_id = excluded.module_id, path = excluded.path
+        RETURNING id
         """,
         (fqn, module_id, path),
     )
-    conn.commit()
-    if cur.lastrowid:
-        return cur.lastrowid
-    row = conn.execute("SELECT id FROM package WHERE fqn = ?", (fqn,)).fetchone()
-    return row["id"]
+    package_id = cur.fetchone()["id"]
+    if commit:
+        conn.commit()
+    return package_id
 
 
 def get_package(conn: sqlite3.Connection, package_id: int) -> sqlite3.Row | None:
@@ -120,6 +123,7 @@ def insert_class(
     visibility: str = "public",
     superclass_fqn: str | None = None,
     summary: str | None = None,
+    commit: bool = True,
 ) -> int:
     cur = conn.execute(
         """
@@ -141,6 +145,7 @@ def insert_class(
             visibility = excluded.visibility,
             superclass_fqn = excluded.superclass_fqn,
             summary = excluded.summary
+        RETURNING id
         """,
         (
             fqn,
@@ -158,11 +163,10 @@ def insert_class(
             summary,
         ),
     )
-    conn.commit()
-    if cur.lastrowid:
-        return cur.lastrowid
-    row = conn.execute("SELECT id FROM class WHERE fqn = ?", (fqn,)).fetchone()
-    return row["id"]
+    class_id = cur.fetchone()["id"]
+    if commit:
+        conn.commit()
+    return class_id
 
 
 def get_class(conn: sqlite3.Connection, class_id: int) -> sqlite3.Row | None:
@@ -204,6 +208,7 @@ def insert_method(
     line_start: int | None = None,
     line_end: int | None = None,
     summary: str | None = None,
+    commit: bool = True,
 ) -> int:
     cur = conn.execute(
         """
@@ -226,7 +231,110 @@ def insert_method(
             summary,
         ),
     )
-    conn.commit()
+    if commit:
+        conn.commit()
+    return cur.lastrowid
+
+
+# ------------------------------------------------------------
+# class/method annotations, fields, parameters, interfaces
+# ------------------------------------------------------------
+
+def clear_class_members(conn: sqlite3.Connection, class_id: int, commit: bool = True) -> None:
+    """Remove methods/fields/annotations/interfaces of a class before re-indexing.
+
+    method_annotation / method_parameter rows cascade from method via FK.
+    """
+    conn.execute("DELETE FROM method WHERE class_id = ?", (class_id,))
+    conn.execute("DELETE FROM field WHERE class_id = ?", (class_id,))
+    conn.execute("DELETE FROM class_annotation WHERE class_id = ?", (class_id,))
+    conn.execute("DELETE FROM class_interface WHERE class_id = ?", (class_id,))
+    if commit:
+        conn.commit()
+
+
+def insert_class_annotation(
+    conn: sqlite3.Connection,
+    class_id: int,
+    name: str,
+    attributes: str | None = None,
+    commit: bool = True,
+) -> int:
+    cur = conn.execute(
+        "INSERT INTO class_annotation (class_id, name, attributes) VALUES (?, ?, ?)",
+        (class_id, name, attributes),
+    )
+    if commit:
+        conn.commit()
+    return cur.lastrowid
+
+
+def insert_class_interface(
+    conn: sqlite3.Connection, class_id: int, interface_fqn: str, commit: bool = True
+) -> None:
+    conn.execute(
+        "INSERT OR IGNORE INTO class_interface (class_id, interface_fqn) VALUES (?, ?)",
+        (class_id, interface_fqn),
+    )
+    if commit:
+        conn.commit()
+
+
+def insert_method_annotation(
+    conn: sqlite3.Connection,
+    method_id: int,
+    name: str,
+    attributes: str | None = None,
+    commit: bool = True,
+) -> int:
+    cur = conn.execute(
+        "INSERT INTO method_annotation (method_id, name, attributes) VALUES (?, ?, ?)",
+        (method_id, name, attributes),
+    )
+    if commit:
+        conn.commit()
+    return cur.lastrowid
+
+
+def insert_method_parameter(
+    conn: sqlite3.Connection,
+    method_id: int,
+    position: int,
+    name: str | None,
+    type_fqn: str | None,
+    commit: bool = True,
+) -> int:
+    cur = conn.execute(
+        "INSERT INTO method_parameter (method_id, position, name, type_fqn) VALUES (?, ?, ?, ?)",
+        (method_id, position, name, type_fqn),
+    )
+    if commit:
+        conn.commit()
+    return cur.lastrowid
+
+
+def insert_field(
+    conn: sqlite3.Connection,
+    class_id: int,
+    name: str,
+    type_fqn: str | None = None,
+    visibility: str = "private",
+    is_static: bool = False,
+    is_injected: bool = False,
+    annotation_names: str | None = None,
+    commit: bool = True,
+) -> int:
+    cur = conn.execute(
+        """
+        INSERT INTO field (
+            class_id, name, type_fqn, visibility, is_static, is_injected, annotation_names
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (class_id, name, type_fqn, visibility, int(is_static), int(is_injected), annotation_names),
+    )
+    if commit:
+        conn.commit()
     return cur.lastrowid
 
 
