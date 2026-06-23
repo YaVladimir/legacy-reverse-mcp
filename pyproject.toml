@@ -1,0 +1,26 @@
+[project]
+name = "legacy-reverse-mcp"
+version = "0.1.0"
+description = "Reverse-engineering MCP server for legacy Java/Spring backends"
+requires-python = ">=3.11"
+dependencies = [
+    "fastmcp",
+    "pydantic",
+    "pyyaml",
+    "tree-sitter",
+    "tree-sitter-java",
+    "click",
+]
+
+[project.scripts]
+legacy-reverse = "cli:cli"
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["cli", "mcp_server"]
+
+[tool.setuptools.packages.find]
+include = ["scanner*", "index*", "summarizer*"]

@@ -1,0 +1,290 @@
+"""SQLite repository layer: schema bootstrap + basic CRUD for module/package/class/method/endpoint."""
+
+from __future__ import annotations
+
+import sqlite3
+from pathlib import Path
+
+SCHEMA_PATH = Path(__file__).with_name("schema.sql")
+
+
+def get_conn(db_path: str | Path) -> sqlite3.Connection:
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    return conn
+
+
+def init_db(db_path: str | Path) -> sqlite3.Connection:
+    db_path = Path(db_path)
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = get_conn(db_path)
+    conn.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
+    conn.commit()
+    return conn
+
+
+# ------------------------------------------------------------
+# module
+# ------------------------------------------------------------
+
+def insert_module(
+    conn: sqlite3.Connection,
+    name: str,
+    path: str,
+    build_file: str | None = None,
+    group_id: str | None = None,
+    artifact_id: str | None = None,
+    version: str | None = None,
+    packaging: str | None = None,
+) -> int:
+    cur = conn.execute(
+        """
+        INSERT INTO module (name, path, build_file, group_id, artifact_id, version, packaging)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(name) DO UPDATE SET
+            path = excluded.path,
+            build_file = excluded.build_file,
+            group_id = excluded.group_id,
+            artifact_id = excluded.artifact_id,
+            version = excluded.version,
+            packaging = excluded.packaging
+        """,
+        (name, path, build_file, group_id, artifact_id, version, packaging),
+    )
+    conn.commit()
+    if cur.lastrowid:
+        return cur.lastrowid
+    row = conn.execute("SELECT id FROM module WHERE name = ?", (name,)).fetchone()
+    return row["id"]
+
+
+def get_module(conn: sqlite3.Connection, module_id: int) -> sqlite3.Row | None:
+    return conn.execute("SELECT * FROM module WHERE id = ?", (module_id,)).fetchone()
+
+
+def list_modules(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    return conn.execute("SELECT * FROM module ORDER BY name").fetchall()
+
+
+# ------------------------------------------------------------
+# package
+# ------------------------------------------------------------
+
+def insert_package(
+    conn: sqlite3.Connection, fqn: str, module_id: int | None = None, path: str | None = None
+) -> int:
+    cur = conn.execute(
+        """
+        INSERT INTO package (fqn, module_id, path)
+        VALUES (?, ?, ?)
+        ON CONFLICT(fqn) DO UPDATE SET module_id = excluded.module_id, path = excluded.path
+        """,
+        (fqn, module_id, path),
+    )
+    conn.commit()
+    if cur.lastrowid:
+        return cur.lastrowid
+    row = conn.execute("SELECT id FROM package WHERE fqn = ?", (fqn,)).fetchone()
+    return row["id"]
+
+
+def get_package(conn: sqlite3.Connection, package_id: int) -> sqlite3.Row | None:
+    return conn.execute("SELECT * FROM package WHERE id = ?", (package_id,)).fetchone()
+
+
+def list_packages(conn: sqlite3.Connection, module_id: int | None = None) -> list[sqlite3.Row]:
+    if module_id is not None:
+        return conn.execute(
+            "SELECT * FROM package WHERE module_id = ? ORDER BY fqn", (module_id,)
+        ).fetchall()
+    return conn.execute("SELECT * FROM package ORDER BY fqn").fetchall()
+
+
+# ------------------------------------------------------------
+# class
+# ------------------------------------------------------------
+
+def insert_class(
+    conn: sqlite3.Connection,
+    fqn: str,
+    simple_name: str,
+    file_path: str,
+    package_id: int | None = None,
+    module_id: int | None = None,
+    line_start: int | None = None,
+    line_end: int | None = None,
+    kind: str = "class",
+    role: str = "unknown",
+    is_abstract: bool = False,
+    visibility: str = "public",
+    superclass_fqn: str | None = None,
+    summary: str | None = None,
+) -> int:
+    cur = conn.execute(
+        """
+        INSERT INTO class (
+            fqn, simple_name, package_id, module_id, file_path, line_start, line_end,
+            kind, role, is_abstract, visibility, superclass_fqn, summary
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(fqn) DO UPDATE SET
+            simple_name = excluded.simple_name,
+            package_id = excluded.package_id,
+            module_id = excluded.module_id,
+            file_path = excluded.file_path,
+            line_start = excluded.line_start,
+            line_end = excluded.line_end,
+            kind = excluded.kind,
+            role = excluded.role,
+            is_abstract = excluded.is_abstract,
+            visibility = excluded.visibility,
+            superclass_fqn = excluded.superclass_fqn,
+            summary = excluded.summary
+        """,
+        (
+            fqn,
+            simple_name,
+            package_id,
+            module_id,
+            file_path,
+            line_start,
+            line_end,
+            kind,
+            role,
+            int(is_abstract),
+            visibility,
+            superclass_fqn,
+            summary,
+        ),
+    )
+    conn.commit()
+    if cur.lastrowid:
+        return cur.lastrowid
+    row = conn.execute("SELECT id FROM class WHERE fqn = ?", (fqn,)).fetchone()
+    return row["id"]
+
+
+def get_class(conn: sqlite3.Connection, class_id: int) -> sqlite3.Row | None:
+    return conn.execute("SELECT * FROM class WHERE id = ?", (class_id,)).fetchone()
+
+
+def get_class_by_fqn(conn: sqlite3.Connection, fqn: str) -> sqlite3.Row | None:
+    return conn.execute("SELECT * FROM class WHERE fqn = ?", (fqn,)).fetchone()
+
+
+def list_classes(
+    conn: sqlite3.Connection, module_id: int | None = None, role: str | None = None
+) -> list[sqlite3.Row]:
+    query = "SELECT * FROM class WHERE 1=1"
+    params: list = []
+    if module_id is not None:
+        query += " AND module_id = ?"
+        params.append(module_id)
+    if role is not None:
+        query += " AND role = ?"
+        params.append(role)
+    query += " ORDER BY fqn"
+    return conn.execute(query, params).fetchall()
+
+
+# ------------------------------------------------------------
+# method
+# ------------------------------------------------------------
+
+def insert_method(
+    conn: sqlite3.Connection,
+    class_id: int,
+    name: str,
+    signature: str,
+    return_type: str | None = None,
+    visibility: str = "public",
+    is_static: bool = False,
+    is_constructor: bool = False,
+    line_start: int | None = None,
+    line_end: int | None = None,
+    summary: str | None = None,
+) -> int:
+    cur = conn.execute(
+        """
+        INSERT INTO method (
+            class_id, name, signature, return_type, visibility,
+            is_static, is_constructor, line_start, line_end, summary
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            class_id,
+            name,
+            signature,
+            return_type,
+            visibility,
+            int(is_static),
+            int(is_constructor),
+            line_start,
+            line_end,
+            summary,
+        ),
+    )
+    conn.commit()
+    return cur.lastrowid
+
+
+def get_method(conn: sqlite3.Connection, method_id: int) -> sqlite3.Row | None:
+    return conn.execute("SELECT * FROM method WHERE id = ?", (method_id,)).fetchone()
+
+
+def list_methods(conn: sqlite3.Connection, class_id: int) -> list[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM method WHERE class_id = ? ORDER BY line_start", (class_id,)
+    ).fetchall()
+
+
+# ------------------------------------------------------------
+# endpoint
+# ------------------------------------------------------------
+
+def insert_endpoint(
+    conn: sqlite3.Connection,
+    http_method: str,
+    path: str,
+    full_path: str | None = None,
+    controller_class_id: int | None = None,
+    handler_method_id: int | None = None,
+    produces: str | None = None,
+    consumes: str | None = None,
+    request_dto_fqn: str | None = None,
+    response_dto_fqn: str | None = None,
+    deprecated: bool = False,
+) -> int:
+    cur = conn.execute(
+        """
+        INSERT INTO endpoint (
+            http_method, path, full_path, controller_class_id, handler_method_id,
+            produces, consumes, request_dto_fqn, response_dto_fqn, deprecated
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            http_method,
+            path,
+            full_path,
+            controller_class_id,
+            handler_method_id,
+            produces,
+            consumes,
+            request_dto_fqn,
+            response_dto_fqn,
+            int(deprecated),
+        ),
+    )
+    conn.commit()
+    return cur.lastrowid
+
+
+def get_endpoint(conn: sqlite3.Connection, endpoint_id: int) -> sqlite3.Row | None:
+    return conn.execute("SELECT * FROM endpoint WHERE id = ?", (endpoint_id,)).fetchone()
+
+
+def list_endpoints(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    return conn.execute("SELECT * FROM v_endpoint_full ORDER BY full_path").fetchall()
