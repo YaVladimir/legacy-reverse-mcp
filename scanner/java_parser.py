@@ -49,6 +49,7 @@ class ParsedField:
     type_fqn: str | None
     visibility: str = "private"
     is_static: bool = False
+    is_final: bool = False
     is_injected: bool = False
     annotations: list[ParsedAnnotation] = field(default_factory=list)
 
@@ -155,7 +156,11 @@ def _parse_field(decl: Node) -> list[ParsedField]:
     type_fqn = _text(decl.child_by_field_name("type"))
     visibility = _visibility(modifiers)
     is_static = _has_modifier(modifiers, "static")
+    is_final = _has_modifier(modifiers, "final")
     ann_names = {a.name for a in annotations}
+    # baseline: explicit injection annotations. Constructor-injection (Lombok
+    # @RequiredArgsConstructor over final fields) needs class context and is
+    # upgraded later by spring_scanner.
     is_injected = bool(ann_names & _injection_annotations())
 
     fields: list[ParsedField] = []
@@ -168,6 +173,7 @@ def _parse_field(decl: Node) -> list[ParsedField]:
                     type_fqn=type_fqn,
                     visibility=visibility,
                     is_static=is_static,
+                    is_final=is_final,
                     is_injected=is_injected,
                     annotations=annotations,
                 )

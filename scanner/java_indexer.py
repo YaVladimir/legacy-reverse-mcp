@@ -12,6 +12,11 @@ from pathlib import Path
 from index import repository as repo
 from scanner.java_parser import ParsedClass, parse_file
 from scanner.repo_scanner import IGNORED_DIRS
+from scanner.spring_scanner import (
+    class_uses_constructor_di,
+    classify_role,
+    field_is_injected,
+)
 
 
 @dataclass
@@ -68,6 +73,10 @@ def _persist_class(conn, pc: ParsedClass, module_id: int | None, stats: IndexSta
     if pc.package:
         package_id = repo.insert_package(conn, fqn=pc.package, module_id=module_id, commit=False)
 
+    class_ann_names = {a.name for a in pc.annotations}
+    role = classify_role(class_ann_names, pc.simple_name, pc.kind)
+    uses_ctor_di = class_uses_constructor_di(class_ann_names)
+
     class_id = repo.insert_class(
         conn,
         fqn=pc.fqn,
@@ -78,6 +87,7 @@ def _persist_class(conn, pc: ParsedClass, module_id: int | None, stats: IndexSta
         line_start=pc.line_start,
         line_end=pc.line_end,
         kind=pc.kind,
+        role=role,
         is_abstract=pc.is_abstract,
         visibility=pc.visibility,
         superclass_fqn=pc.superclass_fqn,
@@ -112,6 +122,13 @@ def _persist_class(conn, pc: ParsedClass, module_id: int | None, stats: IndexSta
         stats.methods += 1
 
     for f in pc.fields:
+        field_ann_names = {a.name for a in f.annotations}
+        injected = field_is_injected(
+            field_ann_names,
+            is_final=f.is_final,
+            is_static=f.is_static,
+            class_uses_ctor_di=uses_ctor_di,
+        )
         ann_names = json.dumps([a.name for a in f.annotations]) if f.annotations else None
         repo.insert_field(
             conn,
@@ -120,7 +137,7 @@ def _persist_class(conn, pc: ParsedClass, module_id: int | None, stats: IndexSta
             type_fqn=f.type_fqn,
             visibility=f.visibility,
             is_static=f.is_static,
-            is_injected=f.is_injected,
+            is_injected=injected,
             annotation_names=ann_names,
             commit=False,
         )
