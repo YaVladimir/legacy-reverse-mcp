@@ -150,7 +150,14 @@ def get_change_impact(symbol: str) -> dict:
 
 @mcp.tool()
 def generate_context_pack(task: str, max_tokens: int = 4000) -> dict:
-    raise NotImplementedError
+    """Compact, task-scoped context pack (endpoints + classes + module context)."""
+    from summarizer.context_pack import generate_context_pack as _gen
+
+    conn = _read_conn()
+    try:
+        return _gen(conn, task, max_tokens)
+    finally:
+        conn.close()
 
 
 if __name__ == "__main__":

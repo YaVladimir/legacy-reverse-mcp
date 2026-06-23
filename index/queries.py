@@ -132,7 +132,7 @@ def find_code_areas(conn: sqlite3.Connection, query: str, limit: int = 20) -> di
     endpoints: list[dict] = []
     for h in search_mod.search(conn, query, limit=limit, entity_type="endpoint"):
         row = conn.execute(
-            "SELECT http_method, full_path, controller_fqn, handler_name FROM v_endpoint_full WHERE id = ?",
+            "SELECT id, http_method, full_path, controller_fqn, handler_name FROM v_endpoint_full WHERE id = ?",
             (h["entity_id"],),
         ).fetchone()
         if row:
