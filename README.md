@@ -51,10 +51,10 @@ from the `LEGACY_REVERSE_REPO` environment variable.
 | `explain_class(fqn)` | ✅ | Role, annotations, injected deps, methods, endpoints |
 | `trace_endpoint(endpoint_id)` | ✅ | Heuristic controller → service → repository/persistence chain |
 | `get_module_map()` | ✅ | Modules, inter-module deps, external coordinates, endpoint counts |
-| `get_project_overview()` | 🚧 | Stack, modules, counts, suspicious deps |
-| `find_code_areas(query)` | 🚧 | Keyword search over classes/methods/summaries |
-| `get_change_impact(symbol)` | 🚧 | Direct dependents, affected endpoints, test candidates |
-| `generate_context_pack(task, max_tokens)` | 🚧 | Compact task-scoped context for an agent |
+| `get_project_overview()` | ✅ | Stack, totals, role distribution, top modules, findings |
+| `find_code_areas(query, limit)` | ✅ | FTS keyword search over classes/methods/endpoints |
+| `get_change_impact(symbol)` | ✅ | Direct dependents, affected endpoints, test candidates |
+| `generate_context_pack(task, max_tokens)` | ✅ | Compact task-scoped context pack for an agent |
 
 ## Layout
 
@@ -66,19 +66,28 @@ scanner/
   java_parser.py        tree-sitter-java AST -> classes/methods/fields/annotations
   spring_scanner.py     role classification + injection detection (pure)
   endpoint_scanner.py   JAX-RS + Spring endpoint extraction (pure)
-  java_indexer.py       orchestration: parse -> persist
+  dependency_scanner.py module/external dependency graph (static + optional gradle)
+  java_indexer.py       orchestration: parse -> persist, class-dependency edges
+  pipeline.py           single scan pipeline shared by CLI and MCP
 index/
-  schema.sql            SQLite schema
+  schema.sql            SQLite schema (+ FTS5 search_index)
   repository.py         CRUD
   queries.py            read models for MCP tools
-summarizer/             LLM summaries + context packs (planned)
+  search.py             FTS5 build + query
+  findings.py           heuristic findings (circular deps, god classes, ...)
+summarizer/
+  class_summary.py      deterministic class summaries (LLM-pluggable seam)
+  package_summary.py    package summaries
+  context_pack.py       task-scoped context pack assembly
 ```
 
 ## Status
 
-Days 1–4 of a 5-phase plan are implemented and verified against
+All 5 phases are implemented and verified against
 [Apache Fineract](https://github.com/apache/fineract) (47 Gradle modules,
-~5.3k non-test classes): **974 endpoints** extracted (971 JAX-RS + 3 Spring),
-roles classified (170 controllers / 810 services / 280 entities), and
-constructor-injection traces reaching the persistence layer. Day 5
-(dependency graph / `get_module_map`) is next.
+~5.3k non-test classes): **974 endpoints** (971 JAX-RS + 3 Spring), roles
+classified (170 controllers / 810 services / 280 entities), constructor-injection
+traces reaching the persistence layer, a **147-edge module graph**, **16.5k
+class-dependency edges**, deterministic summaries, a **28k-entity FTS index**,
+and heuristic findings. All **9 MCP tools** are operational. Summaries are
+deterministic for now; the `summarize_class` seam allows swapping in an LLM later.
