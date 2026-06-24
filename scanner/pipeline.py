@@ -71,6 +71,18 @@ def build_index(conn, repo_path: str, progress=None, progress_every: int = 0) ->
     findings = detect_findings(conn)
     echo(f"Findings: {findings or 'none'}.")
 
+    # persist low-confidence inferred findings (layer guesses) so the baseline
+    # report and future tools can read them. Local import: keeps scanner free of
+    # an analysis dependency at module load.
+    from analysis.layers import compute_low_confidence_findings
+
+    repo.clear_inferred_findings(conn, commit=False)
+    inferred = compute_low_confidence_findings(conn)
+    for f in inferred:
+        repo.insert_inferred_finding(conn, f, commit=False)
+    conn.commit()
+    echo(f"Persisted {len(inferred)} inferred finding(s).")
+
     conn.execute(
         "INSERT INTO scan_manifest (repo_path, build_tool, total_files, total_classes, total_endpoints) "
         "VALUES (?, ?, ?, ?, ?)",
@@ -94,5 +106,6 @@ def build_index(conn, repo_path: str, progress=None, progress_every: int = 0) ->
         "package_summaries": package_summaries,
         "search_rows": search_rows,
         "findings": findings,
+        "inferred_findings": len(inferred),
         "parse_failures": stats.files_failed,
     }

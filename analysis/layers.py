@@ -153,3 +153,39 @@ def infer_spring_layer(
     out = finding.model_dump(mode="json")
     out["layer"] = layer  # convenience for callers
     return out
+
+
+def compute_low_confidence_findings(conn, limit: int = 25) -> list[InferredFinding]:
+    """Classes with no stereotype (role 'unknown') but a name/package layer hint.
+
+    Cheap (no per-class facts query): used by the scan to persist into
+    ``inferred_findings`` and surfaced by the baseline report. Each finding has
+    naming/package evidence and low confidence.
+    """
+    out: list[InferredFinding] = []
+    for r in conn.execute(
+        "SELECT cl.fqn, cl.simple_name, cl.file_path, p.fqn AS pkg "
+        "FROM class cl LEFT JOIN package p ON p.id = cl.package_id "
+        "WHERE cl.role = 'unknown' ORDER BY cl.fqn"
+    ):
+        nm = _name_layer(r["simple_name"])
+        pk = _pkg_layer(r["pkg"])
+        if not (nm or pk):
+            continue
+        layer = (nm or pk)[0]
+        reason = f"name '{r['simple_name']}' suggests {nm[0]}" if nm else f"package suggests {pk[0]}"
+        out.append(
+            InferredFinding(
+                finding_type="spring_layer",
+                subject=r["fqn"],
+                summary=f"Possibly a {layer} (no stereotype annotation)",
+                evidence=[
+                    Evidence(kind="naming", description=reason, file_path=r["file_path"], symbol=r["simple_name"])
+                ],
+                confidence=ConfidenceLevel.LOW,
+                limitations=[LIMITATIONS["spring_proxies"]],
+            )
+        )
+        if len(out) >= limit:
+            break
+    return out

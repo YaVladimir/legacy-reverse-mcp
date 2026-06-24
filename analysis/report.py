@@ -12,8 +12,7 @@ import json
 import sqlite3
 from pathlib import Path
 
-from analysis.common import ev
-from analysis.layers import _name_layer, _pkg_layer
+from index import repository as repo
 from models import LIMITATIONS
 
 REPORTS_RELATIVE = Path(".reverse") / "reports"
@@ -92,33 +91,17 @@ def _api_surface(conn, limit=20):
 
 
 def _low_confidence_findings(conn, limit=25):
-    """Classes with no stereotype (role 'unknown') but a name/package layer hint."""
-    out = []
-    for r in conn.execute(
-        "SELECT cl.fqn, cl.simple_name, cl.file_path, p.fqn AS pkg "
-        "FROM class cl LEFT JOIN package p ON p.id = cl.package_id "
-        "WHERE cl.role = 'unknown' ORDER BY cl.fqn"
-    ):
-        nm = _name_layer(r["simple_name"])
-        pk = _pkg_layer(r["pkg"])
-        if not (nm or pk):
-            continue
-        layer = (nm or pk)[0]
-        reason = (
-            f"name '{r['simple_name']}' suggests {nm[0]}" if nm else f"package suggests {pk[0]}"
-        )
-        out.append(
-            {
-                "finding_type": "spring_layer",
-                "subject": r["fqn"],
-                "summary": f"Possibly a {layer} (no stereotype annotation)",
-                "confidence": "low",
-                "evidence": [ev("naming", reason, file_path=r["file_path"], symbol=r["simple_name"])],
-            }
-        )
-        if len(out) >= limit:
-            break
-    return out
+    """Read the low-confidence layer findings persisted during scan."""
+    return [
+        {
+            "finding_type": f["finding_type"],
+            "subject": f["subject"],
+            "summary": f["summary"],
+            "confidence": f["confidence"],
+            "evidence": f["evidence"],
+        }
+        for f in repo.list_inferred_findings(conn, finding_type="spring_layer", limit=limit)
+    ]
 
 
 _LIMITATION_CODES = [

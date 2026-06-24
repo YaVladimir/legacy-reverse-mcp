@@ -14,7 +14,7 @@ from pathlib import Path
 from fastmcp import FastMCP
 
 from index import queries
-from index.repository import get_conn, init_db
+from index.repository import get_conn, init_db, list_inferred_findings
 from analysis.common import meta
 from analysis.explain import explain_class as _explain_class
 from scanner.pipeline import build_index
@@ -133,6 +133,22 @@ def find_code_areas(query: str, limit: int = 20) -> dict:
     finally:
         conn.close()
     return meta(result, confidence="medium", limitation_codes=["ambiguous_simple_name"])
+
+
+@mcp.tool()
+def get_findings(subject: str | None = None, finding_type: str | None = None, limit: int = 200) -> dict:
+    """Inferred findings persisted during scan (e.g. low-confidence layer guesses
+    for classes with no stereotype annotation), each with evidence + confidence."""
+    conn = _read_conn()
+    try:
+        findings = list_inferred_findings(conn, subject=subject, finding_type=finding_type, limit=limit)
+    finally:
+        conn.close()
+    return meta(
+        {"count": len(findings), "findings": findings},
+        confidence="low",
+        limitation_codes=["spring_proxies", "no_call_graph"],
+    )
 
 
 @mcp.tool()
