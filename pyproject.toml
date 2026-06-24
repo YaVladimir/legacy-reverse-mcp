@@ -28,7 +28,10 @@ build-backend = "setuptools.build_meta"
 py-modules = ["cli", "mcp_server"]
 
 [tool.setuptools.packages.find]
-include = ["scanner*", "index*", "summarizer*", "models*"]
+include = ["analysis*", "scanner*", "index*", "summarizer*", "models*"]
+
+[tool.setuptools.package-data]
+index = ["schema.sql"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
