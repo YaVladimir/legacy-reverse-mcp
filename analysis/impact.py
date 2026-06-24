@@ -17,6 +17,16 @@ from index.queries import _simple_type
 _HIGH_VIA = {"call", "field", "field_injection", "inheritance"}
 
 
+def _type_matches(type_str: str | None, target_fqns: set[str], target_simples: set[str]) -> bool:
+    """A stored type references a target. Import-resolved types are FQNs (matched
+    exactly); unresolved same-package types are simple names (matched by simple)."""
+    if not type_str:
+        return False
+    if "." in type_str:
+        return type_str in target_fqns
+    return _simple_type(type_str) in target_simples
+
+
 def _resolve_targets(conn, symbol):
     return conn.execute(
         "SELECT id, fqn, simple_name, role, kind, file_path FROM class "
@@ -43,6 +53,7 @@ def change_impact(conn: sqlite3.Connection, symbol: str, limit: int = 60) -> dic
 
     target_ids = [t["id"] for t in targets]
     target_simples = {t["simple_name"] for t in targets}
+    target_fqns = {t["fqn"] for t in targets}
     ph = ",".join("?" * len(target_ids))
 
     # dependent[cid] -> aggregated record
@@ -71,7 +82,7 @@ def change_impact(conn: sqlite3.Connection, symbol: str, limit: int = 60) -> dic
         "FROM method_call mc JOIN class c ON c.id = mc.caller_class_id "
         "JOIN method m ON m.id = mc.caller_method_id"
     ):
-        if _simple_type(r["receiver_type_fqn"]) not in target_simples or r["cid"] in target_ids:
+        if not _type_matches(r["receiver_type_fqn"], target_fqns, target_simples) or r["cid"] in target_ids:
             continue
         rec = touch(r["cid"], r["fqn"], r["simple_name"], r["role"], r["file_path"])
         rec["via"].add("call")
@@ -86,7 +97,7 @@ def change_impact(conn: sqlite3.Connection, symbol: str, limit: int = 60) -> dic
         "SELECT f.class_id AS cid, c.fqn, c.simple_name, c.role, c.file_path, f.name, f.type_fqn "
         "FROM field f JOIN class c ON c.id = f.class_id"
     ):
-        if _simple_type(r["type_fqn"]) not in target_simples or r["cid"] in target_ids:
+        if not _type_matches(r["type_fqn"], target_fqns, target_simples) or r["cid"] in target_ids:
             continue
         rec = touch(r["cid"], r["fqn"], r["simple_name"], r["role"], r["file_path"])
         rec["via"].add("field")

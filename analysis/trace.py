@@ -35,6 +35,12 @@ def _resolve_endpoint(conn, endpoint_id, http_method, path_contains):
 
 
 def _resolve_type_to_class(conn, type_fqn):
+    if not type_fqn:
+        return None
+    # import-resolved types are stored as FQN: match exactly before simple-name
+    row = conn.execute("SELECT * FROM class WHERE fqn = ? LIMIT 1", (type_fqn,)).fetchone()
+    if row is not None:
+        return row
     simple = _simple_type(type_fqn)
     if not simple:
         return None

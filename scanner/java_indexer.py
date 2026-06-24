@@ -10,6 +10,7 @@ from dataclasses import dataclass, field as dc_field
 from pathlib import Path
 
 from index import repository as repo
+from index.queries import _simple_type
 from scanner.endpoint_scanner import class_base_path, extract_endpoints, join_paths
 from scanner.fact_emitter import FactConfig, class_observed_facts, file_import_facts
 from scanner.java_parser import ParsedClass, parse_file
@@ -74,6 +75,41 @@ def _iter_java_files(repo_root: Path, skip_tests: bool):
         for name in filenames:
             if name.endswith(".java"):
                 yield Path(dirpath) / name
+
+
+def _import_map(imports: list[str]) -> dict[str, str]:
+    """{simpleName: fqn} from a file's import statements (skip wildcards; first wins)."""
+    out: dict[str, str] = {}
+    for imp in imports:
+        if imp.endswith(".*"):
+            continue
+        out.setdefault(imp.rsplit(".", 1)[-1], imp)
+    return out
+
+
+def _resolve_types_inplace(pc: ParsedClass, imap: dict[str, str]) -> None:
+    """Rewrite written type names to FQN using the file's imports, so type
+    references match a unique class instead of every same-named candidate.
+
+    Interfaces are left as written: ``_find_impl`` matches ``class_interface``
+    against the simple name, so resolving them would break impl resolution.
+    """
+    if not imap:
+        return
+
+    def r(t: str | None) -> str | None:
+        if not t:
+            return t
+        simple = _simple_type(t)
+        return imap.get(simple, t) if simple else t
+
+    pc.superclass_fqn = r(pc.superclass_fqn)
+    for f in pc.fields:
+        f.type_fqn = r(f.type_fqn)
+    for m in pc.methods:
+        m.return_type = r(m.return_type)
+        for p in m.parameters:
+            p.type_fqn = r(p.type_fqn)
 
 
 def _persist_class(
@@ -235,7 +271,9 @@ def index_repo(
             stats.failures.append((str(rel), f"{type(exc).__name__}: {exc}"))
             continue
 
+        imap = _import_map(parsed.imports)
         for pc in parsed.classes:
+            _resolve_types_inplace(pc, imap)
             _persist_class(conn, pc, module_id, stats, fact_config)
 
         if fact_config is not None:
@@ -254,45 +292,52 @@ def index_repo(
 def index_class_dependencies(conn) -> int:
     """Post-pass: derive intra-project class->class edges from already-indexed data.
 
-    Resolves referenced type simple-names to class ids (external/unknown types are
-    skipped) and records edges in class_dependency. Over-approximates on ambiguous
-    simple-names (links all candidates) so change-impact never misses a dependent.
+    FQN-first matching: a reference resolved (via imports) to a known class fqn
+    links exactly that class; otherwise it falls back to linking every
+    same-simple-name candidate (over-approximation, so change-impact never misses
+    a dependent). Interfaces stay simple-name (see _resolve_types_inplace).
     """
-    from index.queries import _simple_type  # local import: avoids import cycle at module load
-
     repo.clear_class_dependencies(conn, commit=False)
 
     name_to_ids: dict[str, list[int]] = {}
-    for r in conn.execute("SELECT id, simple_name FROM class"):
+    fqn_to_id: dict[str, int] = {}
+    for r in conn.execute("SELECT id, simple_name, fqn FROM class"):
         name_to_ids.setdefault(r["simple_name"], []).append(r["id"])
+        fqn_to_id[r["fqn"]] = r["id"]
 
-    # collect references per class in a few bulk queries (not per-class)
+    # collect references per class in a few bulk queries (not per-class); keep the
+    # written type as-is so an FQN can be matched exactly before simple-name.
     refs: dict[int, list[tuple[str | None, str]]] = {}
 
-    def add(cid, simple, kind):
-        refs.setdefault(cid, []).append((simple, kind))
+    def add(cid, ref, kind):
+        refs.setdefault(cid, []).append((ref, kind))
 
     for r in conn.execute("SELECT id, superclass_fqn FROM class WHERE superclass_fqn IS NOT NULL"):
-        add(r["id"], _simple_type(r["superclass_fqn"]), "inheritance")
+        add(r["id"], r["superclass_fqn"], "inheritance")
     for r in conn.execute("SELECT class_id, interface_fqn FROM class_interface"):
-        add(r["class_id"], _simple_type(r["interface_fqn"]), "inheritance")
+        add(r["class_id"], r["interface_fqn"], "inheritance")
     for r in conn.execute("SELECT class_id, type_fqn FROM field WHERE is_injected = 1"):
-        add(r["class_id"], _simple_type(r["type_fqn"]), "field_injection")
+        add(r["class_id"], r["type_fqn"], "field_injection")
     for r in conn.execute("SELECT class_id, return_type FROM method WHERE return_type IS NOT NULL"):
-        add(r["class_id"], _simple_type(r["return_type"]), "return_type")
+        add(r["class_id"], r["return_type"], "return_type")
     for r in conn.execute(
         "SELECT m.class_id AS class_id, mp.type_fqn AS t FROM method_parameter mp "
         "JOIN method m ON m.id = mp.method_id WHERE mp.type_fqn IS NOT NULL"
     ):
-        add(r["class_id"], _simple_type(r["t"]), "method_param")
+        add(r["class_id"], r["t"], "method_param")
 
     edges = 0
     for cid, ref_list in refs.items():
         seen: set[tuple[int, str]] = set()
-        for simple, kind in ref_list:
-            if not simple:
+        for ref, kind in ref_list:
+            if not ref:
                 continue
-            for tid in name_to_ids.get(simple, []):
+            if ref in fqn_to_id:
+                targets = [fqn_to_id[ref]]  # precise: resolved to a unique class
+            else:
+                simple = _simple_type(ref)
+                targets = name_to_ids.get(simple, []) if simple else []
+            for tid in targets:
                 if tid == cid or (tid, kind) in seen:
                     continue
                 seen.add((tid, kind))

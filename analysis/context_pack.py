@@ -29,6 +29,11 @@ def _class_row(conn, fqn):
 
 
 def _resolve_simple(conn, type_fqn):
+    if not type_fqn:
+        return None
+    row = conn.execute("SELECT * FROM class WHERE fqn = ? LIMIT 1", (type_fqn,)).fetchone()
+    if row is not None:
+        return row
     simple = _simple_type(type_fqn)
     if not simple:
         return None
