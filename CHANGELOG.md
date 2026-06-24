@@ -46,6 +46,15 @@ deterministic; no LLM calls in tests.
 - `trace_endpoint` accepts `http_method` / `path_contains` in addition to
   `endpoint_id`.
 
+### Removed (dead/legacy)
+- `summarizer/context_pack.py` — superseded by `analysis/context_pack.py`; no
+  importers remained.
+- `index/queries.py`: legacy `trace_endpoint` and `change_impact` (+ private
+  helpers `_resolve_type`, `_find_impl`, `_injected_of`, `_looks_like`) —
+  superseded by `analysis/trace.py` and `analysis/impact.py`; no callers
+  remained. `_PERSISTENCE_TYPES`, `_simple_type` and `class_detail` are kept
+  (still used).
+
 ### Fixed
 - Root module path `.` is normalised to the catch-all, so classes at the repo
   root attribute to their module (single-module repos previously got
