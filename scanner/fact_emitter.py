@@ -230,6 +230,7 @@ def class_observed_facts(
             is_final=f.is_final,
             is_static=f.is_static,
             class_uses_ctor_di=uses_ctor_di,
+            ctor_assigned=f.name in pc.ctor_injected_fields,
         )
         interesting = injected or bool(f.annotations)
         if not (config.record_all_fields or interesting):

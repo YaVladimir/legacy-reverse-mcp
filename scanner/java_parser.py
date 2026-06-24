@@ -97,6 +97,8 @@ class ParsedClass:
     annotations: list[ParsedAnnotation] = field(default_factory=list)
     methods: list[ParsedMethod] = field(default_factory=list)
     fields: list[ParsedField] = field(default_factory=list)
+    # fields assigned from a constructor parameter (this.x = x) — DI without Lombok
+    ctor_injected_fields: set[str] = field(default_factory=set)
 
 
 @dataclass
@@ -256,6 +258,58 @@ def _collect_calls(decl: Node) -> list[ParsedCall]:
     return out
 
 
+def _assignment_target_field(left: Node | None) -> str | None:
+    """Field name targeted by an assignment LHS: ``this.x`` or a bare ``x``."""
+    if left is None:
+        return None
+    if left.type == "field_access":
+        obj = left.child_by_field_name("object")
+        if obj is not None and obj.type == "this":
+            return _text(left.child_by_field_name("field"))
+        return None
+    if left.type == "identifier":
+        return _text(left)
+    return None
+
+
+def _ctor_assigned_fields(ctor: Node) -> set[str]:
+    """Fields assigned directly from a constructor parameter (``this.x = x``)."""
+    params: set[str] = set()
+    fp = next((c for c in ctor.children if c.type == "formal_parameters"), None)
+    if fp is not None:
+        for p in fp.children:
+            if p.type in ("formal_parameter", "spread_parameter"):
+                nm = _text(p.child_by_field_name("name"))
+                if nm:
+                    params.add(nm)
+    if not params:
+        return set()
+
+    out: set[str] = set()
+    stack = list(ctor.children)
+    while stack:
+        node = stack.pop()
+        if node.type == "assignment_expression":
+            right = node.child_by_field_name("right")
+            if right is not None and right.type == "identifier" and _text(right) in params:
+                fname = _assignment_target_field(node.child_by_field_name("left"))
+                if fname:
+                    out.add(fname)
+        stack.extend(node.children)
+    return out
+
+
+def _collect_ctor_injected_fields(body: Node | None) -> set[str]:
+    """Union of constructor-parameter-assigned fields across all constructors."""
+    if body is None:
+        return set()
+    out: set[str] = set()
+    for member in body.children:
+        if member.type == "constructor_declaration":
+            out |= _ctor_assigned_fields(member)
+    return out
+
+
 def _parse_method(decl: Node, class_name: str) -> ParsedMethod:
     modifiers = _modifiers_node(decl)
     is_constructor = decl.type == "constructor_declaration"
@@ -341,6 +395,7 @@ def _parse_type_declaration(
                 parsed.fields.extend(_parse_field(member))
             elif member.type in ("method_declaration", "constructor_declaration"):
                 parsed.methods.append(_parse_method(member, simple_name))
+        parsed.ctor_injected_fields = _collect_ctor_injected_fields(body)
     return parsed
 
 

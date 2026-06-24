@@ -219,6 +219,7 @@ def _persist_class(
             is_final=f.is_final,
             is_static=f.is_static,
             class_uses_ctor_di=uses_ctor_di,
+            ctor_assigned=f.name in pc.ctor_injected_fields,
         )
         ann_names = json.dumps([a.name for a in f.annotations]) if f.annotations else None
         repo.insert_field(

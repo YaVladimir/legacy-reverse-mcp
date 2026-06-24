@@ -59,12 +59,19 @@ def field_is_injected(
     is_final: bool,
     is_static: bool,
     class_uses_ctor_di: bool,
+    ctor_assigned: bool = False,
 ) -> bool:
-    """Decide whether a field is a dependency injection point."""
+    """Decide whether a field is a dependency injection point.
+
+    ``ctor_assigned`` covers hand-written constructor injection (``this.x = x``)
+    without Lombok / field annotations.
+    """
     if is_static:
         return False
     if field_annotation_names & _FIELD_DI_ANNOTATIONS:
         return True
     if class_uses_ctor_di and is_final:
+        return True
+    if ctor_assigned:
         return True
     return False
