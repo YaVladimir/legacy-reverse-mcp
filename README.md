@@ -13,7 +13,7 @@ Two paths matter when you use it:
 - **This repository**: the cloned `legacy-reverse-mcp` project that contains the
   Python CLI and MCP server.
 - **Target repository**: the Java/Spring project you want to analyze. Point
-  `LEGACY_REVERSE_REPO` and `legacy-reverse scan --repo` at this repo.
+  `LEGACY_REVERSE_REPO` and the scan command at this repo.
 
 - **Stack:** Python 3.11+, [FastMCP](https://github.com/jlowin/fastmcp), SQLite, tree-sitter-java
 - **Frameworks:** Spring MVC (`@RestController`, `@GetMapping`, ...) and JAX-RS
@@ -74,15 +74,19 @@ macOS/Linux:
 
 Run this against the **target Java/Spring repo**, not this MCP repo:
 
+macOS/Linux:
+
 ```bash
-legacy-reverse scan --repo /path/to/java-project --report
+./.venv/bin/legacy-reverse scan --repo /path/to/java-project --report
 ```
 
-Windows example:
+Windows PowerShell:
 
 ```powershell
-legacy-reverse scan --repo C:\path\to\java-project --report
+.venv\Scripts\legacy-reverse.exe scan --repo C:\path\to\java-project --report
 ```
+
+If your virtual environment is activated, `legacy-reverse scan ...` works too.
 
 The scan writes the index and baseline reports into the target repo:
 
@@ -285,7 +289,16 @@ Use legacy-reverse to generate a context pack for the task: "change validation r
 
 ### `Index not found`
 
-- Run `legacy-reverse scan --repo /path/to/java-project --report`.
+- Run the scan first:
+
+  ```bash
+  ./.venv/bin/legacy-reverse scan --repo /path/to/java-project --report
+  ```
+
+  ```powershell
+  .venv\Scripts\legacy-reverse.exe scan --repo C:\path\to\java-project --report
+  ```
+
 - Or ask the MCP tool `scan_repository` to scan the repo.
 - Ensure the target Java project has `<repo>/.reverse/index.sqlite3`.
 
@@ -296,9 +309,22 @@ Use legacy-reverse to generate a context pack for the task: "change validation r
 
 ## CLI reference
 
+If your virtual environment is activated, or if the venv `bin`/`Scripts`
+directory is in `PATH`, you can use the shorter command:
+
 ```bash
 legacy-reverse scan --repo /path/to/java-project [--force] [--resolve] [--report]
 legacy-reverse report --repo /path/to/java-project
+```
+
+Without activation, call the installed console script from the venv directly:
+
+```bash
+./.venv/bin/legacy-reverse scan --repo /path/to/java-project --report
+```
+
+```powershell
+.venv\Scripts\legacy-reverse.exe scan --repo C:\path\to\java-project --report
 ```
 
 `scan` walks the repo, detects Maven/Gradle modules, parses every non-test
