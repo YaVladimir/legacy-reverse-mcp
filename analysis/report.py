@@ -9,6 +9,7 @@ on empty/tiny projects.
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from pathlib import Path
 
@@ -18,6 +19,36 @@ from models import LIMITATIONS
 REPORTS_RELATIVE = Path(".reverse") / "reports"
 
 _LISTENER_ANNOTATIONS = ("@KafkaListener", "@JmsListener", "@RabbitListener")
+
+# config keys that look like outbound HTTP integration endpoints ...
+_URL_KEY_SUFFIXES = (".url", ".uri", ".base-url", ".baseurl", ".endpoint")
+# ... minus infrastructure (datastore/broker/management) URLs that aren't app-to-app clients
+_INFRA_URL_PREFIXES = (
+    "spring.datasource", "spring.r2dbc", "spring.flyway", "spring.liquibase",
+    "spring.jpa", "spring.data", "spring.rabbitmq", "spring.kafka", "spring.redis",
+    "spring.activemq", "spring.artemis", "spring.elasticsearch", "spring.mail",
+    "spring.cloud.config", "spring.cloud.bus", "spring.cloud.vault", "spring.h2",
+    "management", "server", "eureka", "logging", "springdoc", "springfox",
+)
+_URL_CREDS_RE = re.compile(r"://[^/@\s:]+:[^/@\s]+@")
+
+
+def _mask_url_creds(value: str | None) -> str | None:
+    """Redact ``user:pass@`` embedded in a URL value before it reaches the report."""
+    if not value:
+        return value
+    return _URL_CREDS_RE.sub("://***:***@", value)
+
+
+def _external_service_url_keys(conn) -> list[dict]:
+    """Distinct non-secret config keys that name an outbound service endpoint."""
+    seen: dict[str, str | None] = {}
+    for r in conn.execute("SELECT key, value FROM config_property WHERE is_secret = 0 ORDER BY key"):
+        low = r["key"].lower()
+        if not low.endswith(_URL_KEY_SUFFIXES) or low.startswith(_INFRA_URL_PREFIXES):
+            continue
+        seen.setdefault(r["key"], r["value"])
+    return [{"key": k, "value": _mask_url_creds(v)} for k, v in seen.items()]
 
 
 def _scalar(conn, sql, params=()):
@@ -50,6 +81,8 @@ def _inventory(conn) -> dict:
             _scalar(conn, "SELECT COUNT(DISTINCT class_id) FROM class_annotation WHERE name = '@FeignClient'")
             + _scalar(conn, "SELECT COUNT(*) FROM field WHERE type_fqn IN ('RestTemplate', 'WebClient')")
         ),
+        # complementary, config-derived signal (kept separate from the code-based count above)
+        "external_service_urls": len(_external_service_url_keys(conn)),
     }
 
 
@@ -104,6 +137,34 @@ def _low_confidence_findings(conn, limit=25):
     ]
 
 
+def _config(conn) -> dict:
+    files = repo.list_config_files(conn)
+    kinds: dict[str, int] = {}
+    for f in files:
+        kinds[f["kind"]] = kinds.get(f["kind"], 0) + 1
+    datasources = [
+        {"key": r["key"], "value": _mask_url_creds(r["value"])}
+        for r in conn.execute(
+            "SELECT DISTINCT key, value FROM config_property "
+            "WHERE is_secret = 0 AND lower(key) LIKE '%datasource%url%' ORDER BY key"
+        )
+    ]
+    return {
+        "files": len(files),
+        "properties": repo.count_config_properties(conn),
+        "kinds": kinds,
+        "profiles": sorted({f["profile"] for f in files if f["profile"]}),
+        "datasources": datasources,
+        "external_service_urls": _external_service_url_keys(conn),
+        "feign_config_keys": _scalar(
+            conn,
+            "SELECT COUNT(DISTINCT key) FROM config_property "
+            "WHERE lower(key) LIKE 'feign.%' OR lower(key) LIKE '%.feign.%'",
+        ),
+        "secret_keys": _scalar(conn, "SELECT COUNT(*) FROM config_property WHERE is_secret = 1"),
+    }
+
+
 _LIMITATION_CODES = [
     "external_types_unresolved", "interface_impl_unresolved", "spring_proxies",
     "syntactic_calls", "no_call_graph", "dynamic_endpoints", "tests_not_indexed",
@@ -120,6 +181,7 @@ def collect_baseline(conn: sqlite3.Connection) -> dict:
         "top_modules": _top_modules(conn),
         "top_packages": _top_packages(conn),
         "api_surface": _api_surface(conn),
+        "config": _config(conn),
         "low_confidence_findings": _low_confidence_findings(conn),
         "limitations": [LIMITATIONS[c].model_dump(mode="json") for c in _LIMITATION_CODES],
     }
@@ -141,6 +203,7 @@ def render_markdown(data: dict) -> str:
         ("Services", "services"), ("Repositories", "repositories"), ("Entities", "entities"),
         ("Endpoints", "endpoints"), ("Scheduled jobs", "scheduled_jobs"),
         ("Message listeners", "message_listeners"), ("External clients", "external_clients"),
+        ("External service URLs (config)", "external_service_urls"),
     ]:
         lines.append(f"- {label}: {inv.get(key, 0)}")
     lines.append("")
@@ -157,6 +220,27 @@ def render_markdown(data: dict) -> str:
     for e in api["sample"]:
         ctrl = (e["controller"] or "").split(".")[-1]
         lines.append(f"- `{e['http_method']} {e['path']}` -> {ctrl}")
+
+    cfg = data.get("config") or {}
+    lines += ["", "## Config / profiles", ""]
+    kinds = ", ".join(f"{k}: {v}" for k, v in sorted(cfg.get("kinds", {}).items())) or "none"
+    lines.append(f"- Config files: {cfg.get('files', 0)} ({kinds})")
+    lines.append(
+        f"- Properties: {cfg.get('properties', 0)} "
+        f"({cfg.get('secret_keys', 0)} secret-bearing, values masked)"
+    )
+    profiles = cfg.get("profiles") or []
+    lines.append(f"- Profiles: {', '.join(profiles) if profiles else '(default only)'}")
+    for d in cfg.get("datasources", []):
+        lines.append(f"- Datasource `{d['key']}` = `{d['value']}`")
+    ext = cfg.get("external_service_urls") or []
+    if ext:
+        lines.append(f"- External service URLs (from config, heuristic): {len(ext)}")
+        for e in ext[:10]:
+            val = f" = `{e['value']}`" if e.get("value") else ""
+            lines.append(f"    - `{e['key']}`{val}")
+    if cfg.get("feign_config_keys"):
+        lines.append(f"- Feign config keys: {cfg['feign_config_keys']}")
 
     lines += ["", "## Candidate domain areas", ""]
     for p in data["top_packages"][:8]:

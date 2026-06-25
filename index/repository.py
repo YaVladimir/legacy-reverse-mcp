@@ -505,6 +505,109 @@ def list_module_dependencies(conn: sqlite3.Connection) -> list[sqlite3.Row]:
 
 
 # ------------------------------------------------------------
+# config files / properties (application.yml / .properties)
+# ------------------------------------------------------------
+
+def clear_config(conn: sqlite3.Connection, commit: bool = True) -> None:
+    # config_property rows cascade from config_file via FK ON DELETE CASCADE
+    conn.execute("DELETE FROM config_file")
+    if commit:
+        conn.commit()
+
+
+def insert_config_file(
+    conn: sqlite3.Connection,
+    file_path: str,
+    kind: str = "unknown",
+    module_id: int | None = None,
+    profile: str | None = None,
+    commit: bool = True,
+) -> int:
+    cur = conn.execute(
+        """
+        INSERT INTO config_file (module_id, file_path, kind, profile)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(file_path) DO UPDATE SET
+            module_id = excluded.module_id,
+            kind = excluded.kind,
+            profile = excluded.profile
+        RETURNING id
+        """,
+        (module_id, file_path, kind, profile),
+    )
+    config_file_id = cur.fetchone()["id"]
+    if commit:
+        conn.commit()
+    return config_file_id
+
+
+def insert_config_property(
+    conn: sqlite3.Connection,
+    config_file_id: int,
+    key: str,
+    value: str | None = None,
+    is_secret: bool = False,
+    commit: bool = True,
+) -> int:
+    cur = conn.execute(
+        "INSERT INTO config_property (config_file_id, key, value, is_secret) "
+        "VALUES (?, ?, ?, ?)",
+        (config_file_id, key, value, int(is_secret)),
+    )
+    if commit:
+        conn.commit()
+    return cur.lastrowid
+
+
+def list_config_files(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    return conn.execute(
+        "SELECT cf.id, cf.file_path, cf.kind, cf.profile, mo.name AS module_name, "
+        "       COUNT(cp.id) AS property_count "
+        "FROM config_file cf "
+        "LEFT JOIN module mo ON mo.id = cf.module_id "
+        "LEFT JOIN config_property cp ON cp.config_file_id = cf.id "
+        "GROUP BY cf.id ORDER BY cf.file_path"
+    ).fetchall()
+
+
+def list_config_properties(
+    conn: sqlite3.Connection,
+    key_contains: str | None = None,
+    profile: str | None = None,
+    include_secret_values: bool = False,
+    limit: int = 500,
+) -> list[dict]:
+    """Read config properties joined to their file/profile. Secret values are
+    masked unless ``include_secret_values`` is set (the index keeps them raw)."""
+    query = (
+        "SELECT cp.key, cp.value, cp.is_secret, cf.file_path, cf.profile "
+        "FROM config_property cp JOIN config_file cf ON cf.id = cp.config_file_id "
+        "WHERE 1=1"
+    )
+    params: list = []
+    if key_contains:
+        query += " AND cp.key LIKE ?"
+        params.append(f"%{key_contains}%")
+    if profile is not None:
+        query += " AND cf.profile IS ?"
+        params.append(profile)
+    query += " ORDER BY cf.file_path, cp.key LIMIT ?"
+    params.append(limit)
+
+    out: list[dict] = []
+    for r in conn.execute(query, params):
+        d = dict(r)
+        if d["is_secret"] and not include_secret_values:
+            d["value"] = "***"
+        out.append(d)
+    return out
+
+
+def count_config_properties(conn: sqlite3.Connection) -> int:
+    return conn.execute("SELECT COUNT(*) FROM config_property").fetchone()[0]
+
+
+# ------------------------------------------------------------
 # summaries
 # ------------------------------------------------------------
 

@@ -152,6 +152,33 @@ def get_findings(subject: str | None = None, finding_type: str | None = None, li
 
 
 @mcp.tool()
+def get_config(key_contains: str | None = None, profile: str | None = None, limit: int = 200) -> dict:
+    """Spring externalized configuration indexed from application*.{yml,properties}
+    and bootstrap*.* — config files (with profile) plus individual properties,
+    optionally filtered by key substring or profile. Secret-bearing values
+    (password/secret/token/...) are masked. Static read: ${...} placeholders are
+    not resolved."""
+    from index.repository import list_config_files, list_config_properties
+
+    conn = _read_conn()
+    try:
+        files = [dict(r) for r in list_config_files(conn)]
+        props = list_config_properties(conn, key_contains=key_contains, profile=profile, limit=limit)
+    finally:
+        conn.close()
+    return meta(
+        {
+            "config_file_count": len(files),
+            "files": files,
+            "property_count": len(props),
+            "properties": props,
+        },
+        confidence="high",  # values are read verbatim from the config files
+        limitation_codes=["config_not_resolved"],
+    )
+
+
+@mcp.tool()
 def get_module_map() -> dict:
     """Module graph: modules with inter-module deps, external coordinates, endpoint counts."""
     conn = _read_conn()

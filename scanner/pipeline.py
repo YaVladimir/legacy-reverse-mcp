@@ -10,6 +10,7 @@ from __future__ import annotations
 from index import repository as repo
 from index.findings import detect_findings
 from index.search import build_search_index
+from scanner.config_scanner import index_config
 from scanner.dependency_scanner import index_dependencies
 from scanner.java_indexer import index_class_dependencies, index_repo
 from scanner.repo_scanner import scan_repo
@@ -58,6 +59,14 @@ def build_index(conn, repo_path: str, progress=None, progress_every: int = 0) ->
         f"{dep_stats.external_deps} external dependency declaration(s)."
     )
 
+    echo("Indexing configuration ...")
+    config_stats = index_config(conn, repo_path)
+    echo(
+        f"Indexed {config_stats.config_files} config file(s), "
+        f"{config_stats.config_properties} propert(ies) across "
+        f"{len(config_stats.profiles)} profile(s); {config_stats.secrets} secret-bearing."
+    )
+
     echo("Generating summaries ...")
     class_summaries = generate_class_summaries(conn)
     package_summaries = generate_package_summaries(conn)
@@ -102,6 +111,10 @@ def build_index(conn, repo_path: str, progress=None, progress_every: int = 0) ->
         "class_edges": class_edges,
         "module_edges": dep_stats.module_edges,
         "external_deps": dep_stats.external_deps,
+        "config_files": config_stats.config_files,
+        "config_properties": config_stats.config_properties,
+        "config_profiles": sorted(config_stats.profiles),
+        "config_secrets": config_stats.secrets,
         "class_summaries": class_summaries,
         "package_summaries": package_summaries,
         "search_rows": search_rows,

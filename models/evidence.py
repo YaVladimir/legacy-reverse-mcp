@@ -146,6 +146,10 @@ LIMITATIONS: dict[str, Limitation] = {
             code="external_types_unresolved",
             description="Types outside the scanned project (framework/library classes) are not resolved to a definition.",
         ),
+        Limitation(
+            code="config_not_resolved",
+            description="Config is read statically: ${...} placeholders are not resolved, and profile activation / import / override precedence is not computed.",
+        ),
     ]
 }
 
