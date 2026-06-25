@@ -1,74 +1,315 @@
 # legacy-reverse-mcp
 
-A **source-first** MCP server that helps a developer or an LLM agent understand a
-legacy **Java / Spring** backend fast: REST endpoints, Spring/JAX-RS layers, class
-roles, dependency-injection wiring, heuristic request traces, change impact and
-task-scoped context packs.
+`legacy-reverse-mcp` is a **source-first** MCP server for understanding legacy
+**Java / Spring** backends quickly. It helps a developer or an LLM agent find
+REST endpoints, Spring/JAX-RS layers, dependency-injection wiring, heuristic
+request traces, change impact, and task-scoped context packs.
 
-It parses sources with `tree-sitter-java` into a SQLite index (no compilation
-required) and answers questions over that index. It is **not** an exhaustive
-reverse-engineering suite and does **not** promise 100% accuracy. Instead, every
-heuristic answer **shows its work**: it separates *observed facts* from *inferred
-findings*, attaches *evidence* (file + line) to each, reports a *confidence*
-level, and lists the *limitations* that bound the answer.
+It parses Java sources with `tree-sitter-java` into a SQLite index. No Java
+compilation is required.
+
+Two paths matter when you use it:
+
+- **This repository**: the cloned `legacy-reverse-mcp` project that contains the
+  Python CLI and MCP server.
+- **Target repository**: the Java/Spring project you want to analyze. Point
+  `LEGACY_REVERSE_REPO` and `legacy-reverse scan --repo` at this repo.
 
 - **Stack:** Python 3.11+, [FastMCP](https://github.com/jlowin/fastmcp), SQLite, tree-sitter-java
-- **Frameworks:** Spring MVC (`@RestController`, `@GetMapping`, …) **and** JAX-RS
-  (`jakarta.ws.rs` `@Path`, `@GET`, …); Spring + Lombok constructor injection
+- **Frameworks:** Spring MVC (`@RestController`, `@GetMapping`, ...) and JAX-RS
+  (`jakarta.ws.rs` `@Path`, `@GET`, ...); Spring + Lombok constructor injection
   (`@RequiredArgsConstructor` over `final` fields)
 
 ## What it can and cannot do
 
-**Can:** find endpoints; classify Spring/JAX-RS layers from stereotypes, naming and
-package; follow controller → service → repository using syntactic calls and the DI
-graph; estimate candidate change impact; assemble an explained context pack;
-produce a baseline project report.
+**Can:** find endpoints; classify Spring/JAX-RS layers from stereotypes, naming
+and package; follow controller -> service -> repository using syntactic calls
+and the DI graph; estimate candidate change impact; assemble an explained
+context pack; produce a baseline project report.
 
-**Cannot** (by design — see [docs/limitations.md](docs/limitations.md)): bytecode
+**Cannot** (by design; see [docs/limitations.md](docs/limitations.md)): bytecode
 analysis, runtime Spring resolution (proxies/profiles/conditional beans), a full
 polymorphic call graph, or data-flow analysis. False positives are possible; that
 is exactly why results carry confidence + evidence.
 
-## Install
+## Quick start
 
-```bash
-py -m venv .venv
-.venv/Scripts/python -m pip install -e .          # Windows (use `py`/venv, not bare `python`)
-# source .venv/bin/activate && pip install -e .    # Unix
-# dev (tests): pip install -e ".[dev]"
+### 1. Install from source
+
+Windows:
+
+```powershell
+git clone <repo-url>
+cd legacy-reverse-mcp
+
+py -3.11 -m venv .venv
+.venv\Scripts\python -m pip install -e .
 ```
 
-## Scan a repository
+macOS/Linux:
 
 ```bash
-legacy-reverse scan --repo /path/to/java-project [--force] [--resolve] [--report]
+git clone <repo-url>
+cd legacy-reverse-mcp
+
+python3.11 -m venv .venv
+./.venv/bin/python -m pip install -e .
 ```
 
-Walks the repo, detects Maven/Gradle modules, parses every non-test `.java` file,
-records **observed facts with evidence** and intra-class method calls, builds the
-dependency graph, and writes an index to `<repo>/.reverse/index.sqlite3`.
-`--report` also writes a [baseline report](docs/) (see below). `--resolve` runs
-gradle to fill external dependency versions (slower, needs a working build).
+For development and tests, install the optional test dependencies:
 
-## Baseline report
+Windows:
+
+```powershell
+.venv\Scripts\python -m pip install -e ".[dev]"
+```
+
+macOS/Linux:
+
+```bash
+./.venv/bin/python -m pip install -e ".[dev]"
+```
+
+### 2. Scan your Java/Spring repository
+
+Run this against the **target Java/Spring repo**, not this MCP repo:
 
 ```bash
 legacy-reverse scan --repo /path/to/java-project --report
-legacy-reverse report --repo /path/to/java-project   # from an existing index
 ```
 
-Writes `baseline.md` + `baseline.json` to `<repo>/.reverse/reports/`: inventory
-counts, top modules/packages, public API surface, candidate domain areas,
-low-confidence findings and the tool's limitations.
+Windows example:
 
-## Run as an MCP server
+```powershell
+legacy-reverse scan --repo C:\path\to\java-project --report
+```
+
+The scan writes the index and baseline reports into the target repo:
+
+```text
+<repo>/.reverse/index.sqlite3
+<repo>/.reverse/reports/baseline.md
+<repo>/.reverse/reports/baseline.json
+```
+
+Use `--force` to rebuild an existing index. Use `--resolve` only when you want
+Gradle dependency versions resolved and the target project has a working build.
+
+### 3. Run the MCP server manually
+
+Before wiring the server into an MCP client, run it once by hand. Use absolute
+paths because MCP clients often start servers from a different working
+directory.
+
+macOS/Linux:
 
 ```bash
-LEGACY_REVERSE_REPO=/path/to/java-project python mcp_server.py
+LEGACY_REVERSE_REPO=/path/to/java-project /path/to/legacy-reverse-mcp/.venv/bin/python -m mcp_server
 ```
 
-The server resolves its index from the repo passed to `scan_repository`, or from
-the `LEGACY_REVERSE_REPO` environment variable.
+Windows PowerShell:
+
+```powershell
+$env:LEGACY_REVERSE_REPO="C:\path\to\java-project"
+C:\path\to\legacy-reverse-mcp\.venv\Scripts\python.exe -m mcp_server
+```
+
+If the server starts without crashing, your MCP client can run the same command
+as a stdio MCP server.
+
+## Use with MCP clients
+
+All examples below use placeholders. Replace:
+
+- `/path/to/legacy-reverse-mcp` or `C:\path\to\legacy-reverse-mcp` with the
+  absolute path to this Python project.
+- `/path/to/java-project` or `C:\path\to\java-project` with the absolute path to
+  the target Java/Spring repository.
+
+### Claude Code
+
+macOS/Linux:
+
+```bash
+claude mcp add legacy-reverse \
+  --env LEGACY_REVERSE_REPO=/path/to/java-project \
+  -- /path/to/legacy-reverse-mcp/.venv/bin/python -m mcp_server
+```
+
+Windows PowerShell:
+
+```powershell
+claude mcp add legacy-reverse `
+  --env LEGACY_REVERSE_REPO=C:\path\to\java-project `
+  -- C:\path\to\legacy-reverse-mcp\.venv\Scripts\python.exe -m mcp_server
+```
+
+Verify that Claude Code sees the server:
+
+```bash
+claude mcp list
+```
+
+Restart Claude Code after changing MCP configuration.
+
+### Codex CLI
+
+Add a stdio MCP server entry to your Codex CLI MCP config location according to
+your local Codex setup.
+
+macOS/Linux:
+
+```toml
+[mcp_servers.legacy_reverse]
+command = "/path/to/legacy-reverse-mcp/.venv/bin/python"
+args = ["-m", "mcp_server"]
+env = { LEGACY_REVERSE_REPO = "/path/to/java-project" }
+```
+
+Windows:
+
+```toml
+[mcp_servers.legacy_reverse]
+command = "C:\\path\\to\\legacy-reverse-mcp\\.venv\\Scripts\\python.exe"
+args = ["-m", "mcp_server"]
+env = { LEGACY_REVERSE_REPO = "C:\\path\\to\\java-project" }
+```
+
+Restart Codex CLI after changing MCP configuration.
+
+### Qwen Code CLI
+
+Qwen Code reads MCP servers from `mcpServers` in `.qwen/settings.json` for
+project scope, or `~/.qwen/settings.json` for user scope. You can edit the
+settings file directly or use `qwen mcp add`.
+
+Project-local macOS/Linux `.qwen/settings.json`:
+
+```json
+{
+  "mcpServers": {
+    "legacy-reverse": {
+      "command": "/path/to/legacy-reverse-mcp/.venv/bin/python",
+      "args": ["-m", "mcp_server"],
+      "env": {
+        "LEGACY_REVERSE_REPO": "/path/to/java-project"
+      },
+      "timeout": 30000
+    }
+  }
+}
+```
+
+Project-local Windows `.qwen/settings.json`:
+
+```json
+{
+  "mcpServers": {
+    "legacy-reverse": {
+      "command": "C:\\path\\to\\legacy-reverse-mcp\\.venv\\Scripts\\python.exe",
+      "args": ["-m", "mcp_server"],
+      "env": {
+        "LEGACY_REVERSE_REPO": "C:\\path\\to\\java-project"
+      },
+      "timeout": 30000
+    }
+  }
+}
+```
+
+Command alternative for macOS/Linux:
+
+```bash
+qwen mcp add legacy-reverse \
+  -e LEGACY_REVERSE_REPO=/path/to/java-project \
+  --timeout 30000 \
+  /path/to/legacy-reverse-mcp/.venv/bin/python -m mcp_server
+```
+
+Command alternative for Windows PowerShell:
+
+```powershell
+qwen mcp add legacy-reverse `
+  -e LEGACY_REVERSE_REPO=C:\path\to\java-project `
+  --timeout 30000 `
+  C:\path\to\legacy-reverse-mcp\.venv\Scripts\python.exe -m mcp_server
+```
+
+Verify the configured servers:
+
+```bash
+qwen mcp
+```
+
+Restart Qwen Code in the same project after changing MCP configuration.
+
+## First prompts
+
+Once your MCP client shows the `legacy-reverse` tools, try prompts like these:
+
+```text
+Use legacy-reverse to get a project overview.
+```
+
+```text
+Use legacy-reverse to list REST endpoints and group them by module.
+```
+
+```text
+Use legacy-reverse to explain class com.example.SomeService with evidence and confidence.
+```
+
+```text
+Use legacy-reverse to trace the endpoint GET /api/example from controller to persistence.
+```
+
+```text
+Use legacy-reverse to generate a context pack for the task: "change validation rules for deposit opening".
+```
+
+## Troubleshooting
+
+### `legacy-reverse: command not found`
+
+- Ensure the editable install completed successfully.
+- Activate the virtual environment, or call the venv Python explicitly.
+- On Windows, prefer `py` or `.venv\Scripts\python.exe`, not bare `python`.
+
+### MCP client starts, but no tools appear
+
+- Use absolute paths in MCP config.
+- Check that `LEGACY_REVERSE_REPO` points to the target Java/Spring project, not
+  to this `legacy-reverse-mcp` repo.
+- Restart the MCP client after changing config.
+- Run the server manually first to see startup errors.
+
+### `Index not found`
+
+- Run `legacy-reverse scan --repo /path/to/java-project --report`.
+- Or ask the MCP tool `scan_repository` to scan the repo.
+- Ensure the target Java project has `<repo>/.reverse/index.sqlite3`.
+
+### Windows path escaping
+
+- In JSON and TOML strings, use double backslashes: `C:\\path\\to\\repo`.
+- In PowerShell commands, normal backslashes are OK: `C:\path\to\repo`.
+
+## CLI reference
+
+```bash
+legacy-reverse scan --repo /path/to/java-project [--force] [--resolve] [--report]
+legacy-reverse report --repo /path/to/java-project
+```
+
+`scan` walks the repo, detects Maven/Gradle modules, parses every non-test
+`.java` file, records observed facts with evidence and intra-class method calls,
+builds the dependency graph, and writes an index to
+`<repo>/.reverse/index.sqlite3`.
+
+`report` writes `baseline.md` and `baseline.json` to
+`<repo>/.reverse/reports/`: inventory counts, top modules/packages, public API
+surface, candidate domain areas, low-confidence findings, and the tool's
+limitations.
 
 ## MCP tools
 
@@ -81,25 +322,25 @@ Every heuristic tool returns a structured response carrying `confidence`,
 | `scan_repository(repo_path, force)` | Scan + (re)build the index |
 | `list_endpoints(http_method, path_contains, limit)` | REST endpoints (JAX-RS + Spring) |
 | `explain_class(fqn)` | Observed facts + inferred findings + related symbols, all with evidence |
-| `trace_endpoint(endpoint_id \| http_method, path_contains)` | Controller → service → repository trace with per-step + overall confidence |
+| `trace_endpoint(endpoint_id \| http_method, path_contains)` | Controller -> service -> repository trace with per-step + overall confidence |
 | `get_change_impact(symbol)` | `direct_impacts` vs `candidate_impacts`, each with reason/evidence/confidence |
 | `generate_context_pack(task, max_tokens, max_items)` | Explained pack: `selected_items` (with reasons) + `excluded_items` |
 | `get_module_map()` | Modules, inter-module deps, external coordinates, endpoint counts |
 | `get_project_overview()` | Stack, totals, role distribution, top modules, findings |
 | `find_code_areas(query, limit)` | FTS keyword search over classes/methods/endpoints |
 | `get_findings(subject, finding_type, limit)` | Inferred findings persisted during scan, each with evidence + confidence |
-| `get_config(key_contains, profile, limit)` | Spring config (`application*`/`bootstrap*`) — files + properties; secret values masked |
-| `get_class_summary(fqn)` | Deterministic one-line class summary (LLM-swappable `summarize_class` seam) |
+| `get_config(key_contains, profile, limit)` | Spring config (`application*`/`bootstrap*`): files + properties; secret values masked |
+| `get_class_summary(fqn)` | Deterministic one-line class summary |
 
 ## Interpreting confidence
 
-- **high** — a direct fact or an inference over direct (unambiguous) links: a
+- **high**: a direct fact or an inference over direct, unambiguous links: a
   stereotype annotation, an endpoint read from a mapping, a call found
   syntactically in a method body.
-- **medium** — a heuristic inference from several signals: layer from name **and**
+- **medium**: a heuristic inference from several signals: layer from name and
   package, a service/repository found via injection + naming.
-- **low** — a guess from naming/package/keyword similarity only.
-- **unknown** — no usable signal.
+- **low**: a guess from naming/package/keyword similarity only.
+- **unknown**: no usable signal.
 
 Details + examples: [docs/confidence-model.md](docs/confidence-model.md). The
 observed-fact vs inferred-finding model: [docs/evidence-model.md](docs/evidence-model.md).
@@ -107,23 +348,32 @@ observed-fact vs inferred-finding model: [docs/evidence-model.md](docs/evidence-
 ## Golden questions (evaluation)
 
 ```bash
-py eval/run_golden_questions.py          # markdown report; exit 0 only if all pass
+py eval/run_golden_questions.py
 py eval/run_golden_questions.py --json
 ```
 
 A deterministic regression layer that scans a committed Java/Spring fixture and
-checks **structural quality gates** (evidence/confidence/limitations present,
-endpoints found, context pack non-empty). See [docs/golden-questions.md](docs/golden-questions.md).
+checks structural quality gates: evidence/confidence/limitations present,
+endpoints found, context pack non-empty. See
+[docs/golden-questions.md](docs/golden-questions.md).
 
 ## Tests
 
+Windows:
+
+```powershell
+.venv\Scripts\python -m pytest -q
+```
+
+macOS/Linux:
+
 ```bash
-.venv/Scripts/python -m pytest -q
+./.venv/bin/python -m pytest -q
 ```
 
 ## Layout
 
-```
+```text
 cli.py                  CLI: scan (+ --report), report
 mcp_server.py           FastMCP server + tool registrations
 models/evidence.py      Evidence / Confidence / Limitation / ObservedFact / InferredFinding
@@ -139,8 +389,9 @@ docs/                   mcp-api, confidence-model, evidence-model, limitations, 
 ## Status
 
 Verified against [Apache Fineract](https://github.com/apache/fineract) (47 Gradle
-modules, ~5.3k non-test classes): **974 endpoints** (971 JAX-RS + 3 Spring), roles
-classified, constructor-injection traces reaching persistence, a 147-edge module
-graph, 16.5k class-dependency edges, **~48k observed facts with evidence**,
-intra-class call edges, FTS index, baseline report and a green golden-questions
-run. See [CHANGELOG.md](CHANGELOG.md) for the evidence-layer work.
+modules, ~5.3k non-test classes): **974 endpoints** (971 JAX-RS + 3 Spring),
+roles classified, constructor-injection traces reaching persistence, a 147-edge
+module graph, 16.5k class-dependency edges, **~48k observed facts with
+evidence**, intra-class call edges, FTS index, baseline report and a green
+golden-questions run. See [CHANGELOG.md](CHANGELOG.md) for the evidence-layer
+work.
