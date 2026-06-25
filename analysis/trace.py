@@ -183,6 +183,61 @@ def trace_endpoint(
             step_no += 1
             break
 
+    if service_class is None and controller_id is not None and handler_id is not None:
+        # same-class hop: the handler delegates to a helper in this controller that
+        # makes the service call. Step one level into the helper's own field-calls.
+        for call in handler_calls:
+            if call["receiver_field"] is not None or call["receiver_type_fqn"] != controller_fqn:
+                continue  # not a same-class self-call
+            helper = _method_in_class(conn, controller_id, call["callee_name"])
+            if helper is None:
+                continue
+            for inner in _calls_of_method(conn, helper["id"]):
+                target = _resolve_type_to_class(conn, inner["receiver_type_fqn"])
+                if target is None or not _looks_like("service", target):
+                    continue
+                steps.append(
+                    {
+                        "step": step_no,
+                        "kind": "controller_helper",
+                        "symbol": f"{controller_name}#{call['callee_name']}",
+                        "confidence": "high",  # syntactic same-class call
+                        "evidence": [
+                            ev(
+                                "method_call",
+                                f"{controller_name}#{handler_name} delegates to same-class {call['callee_name']}()",
+                                file_path=file_path,
+                                line_start=call["line"],
+                                symbol=f"{controller_name}#{handler_name}",
+                            )
+                        ],
+                    }
+                )
+                step_no += 1
+                service_class = _find_impl(conn, target)
+                service_method_name = inner["callee_name"]
+                steps.append(
+                    {
+                        "step": step_no,
+                        "kind": "service_call",
+                        "symbol": f"{target['simple_name']}#{inner['callee_name']}",
+                        "confidence": "high",  # call found syntactically in the helper body
+                        "evidence": [
+                            ev(
+                                "method_call",
+                                f"{controller_name}#{call['callee_name']} calls {inner['receiver_field']}.{inner['callee_name']}()",
+                                file_path=file_path,
+                                line_start=inner["line"],
+                                symbol=f"{controller_name}#{call['callee_name']}",
+                            )
+                        ],
+                    }
+                )
+                step_no += 1
+                break
+            if service_class is not None:
+                break
+
     if service_class is None and controller_id is not None:
         # fallback: injection + naming
         for fld in _injected_of(conn, controller_id):

@@ -96,6 +96,41 @@ def explain_class(fqn: str) -> dict:
 
 
 @mcp.tool()
+def get_class_summary(fqn: str) -> dict:
+    """Deterministic one-line summary of a class (role, module, endpoints, injected
+    dependencies, method count). Accepts FQN or simple name. The summarize_class
+    seam is where an LLM-backed summary can later be swapped in."""
+    from analysis.common import not_found
+    from summarizer.class_summary import summarize_class
+
+    conn = _read_conn()
+    try:
+        row = conn.execute(
+            "SELECT id, fqn, simple_name FROM class WHERE fqn = ? OR simple_name = ? "
+            "ORDER BY fqn LIMIT 1",
+            (fqn, fqn),
+        ).fetchone()
+        if row is None:
+            suggestions = [
+                {"fqn": s["fqn"], "name": s["simple_name"]}
+                for s in conn.execute(
+                    "SELECT fqn, simple_name FROM class WHERE simple_name LIKE ? OR fqn LIKE ? "
+                    "ORDER BY simple_name LIMIT 5",
+                    (f"%{fqn}%", f"%{fqn}%"),
+                )
+            ]
+            return not_found("class", fqn, suggestions)
+        summary = summarize_class(conn, row["id"])
+    finally:
+        conn.close()
+    return meta(
+        {"fqn": row["fqn"], "name": row["simple_name"], "summary": summary},
+        confidence="medium",  # deterministic rendering over a heuristic role
+        limitation_codes=["spring_proxies"],
+    )
+
+
+@mcp.tool()
 def trace_endpoint(
     endpoint_id: int | None = None,
     http_method: str | None = None,

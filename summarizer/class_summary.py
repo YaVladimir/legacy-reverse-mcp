@@ -42,7 +42,7 @@ def render_class_summary(
 
 
 def summarize_class(conn: sqlite3.Connection, class_id: int) -> str:
-    """On-demand summary for a single class (used by explain/context tools)."""
+    """On-demand summary for a single class (exposed via the get_class_summary MCP tool)."""
     from index.queries import class_detail
 
     cls = conn.execute("SELECT fqn FROM class WHERE id = ?", (class_id,)).fetchone()

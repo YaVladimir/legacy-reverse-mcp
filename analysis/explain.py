@@ -15,6 +15,87 @@ from analysis.layers import infer_spring_layer
 from index import repository as repo
 from index.queries import _simple_type
 
+# HTTP verb -> what the endpoint most likely does (heuristic, but the verb itself
+# is a direct fact). Used to describe each endpoint's purpose.
+_VERB_PURPOSE = {
+    "GET": "reads/queries",
+    "POST": "creates/submits",
+    "PUT": "creates or replaces",
+    "PATCH": "partially updates",
+    "DELETE": "deletes",
+    "HEAD": "checks existence",
+    "OPTIONS": "describes options",
+}
+_MAX_ENDPOINT_FINDINGS = 25
+
+
+def _finding(finding_type, subject, summary, confidence, evidence, limitation_codes=()):
+    """Build a JSON-able inferred finding (same shape as infer_spring_layer)."""
+    assert evidence, "an inferred finding must carry at least one evidence item"
+    return {
+        "finding_type": finding_type,
+        "subject": subject,
+        "summary": summary,
+        "confidence": confidence,
+        "evidence": evidence,
+        "limitations": limitations(*limitation_codes),
+    }
+
+
+def _endpoint_purpose(http_method: str | None, handler_name: str | None) -> str:
+    action = _VERB_PURPOSE.get((http_method or "").upper(), "handles")
+    return f"{action} (handler {handler_name})" if handler_name else action
+
+
+def _transaction_finding(conn, class_id, fqn, simple_name, file_path) -> dict | None:
+    """Class defines transaction boundaries if it (or its methods) carry @Transactional."""
+    methods = conn.execute(
+        "SELECT m.name, m.line_start FROM method m JOIN method_annotation ma ON ma.method_id = m.id "
+        "WHERE m.class_id = ? AND (ma.name = '@Transactional' OR ma.name LIKE '%.Transactional') "
+        "ORDER BY m.line_start",
+        (class_id,),
+    ).fetchall()
+    class_level = conn.execute(
+        "SELECT 1 FROM class_annotation WHERE class_id = ? "
+        "AND (name = '@Transactional' OR name LIKE '%.Transactional')",
+        (class_id,),
+    ).fetchone()
+    if not methods and not class_level:
+        return None
+
+    evidence: list[dict] = []
+    if class_level:
+        evidence.append(
+            ev("annotation", f"{simple_name} is annotated @Transactional", file_path=file_path, symbol=simple_name)
+        )
+    for m in methods[:5]:
+        evidence.append(
+            ev("annotation", f"{simple_name}#{m['name']} is @Transactional",
+               file_path=file_path, line_start=m["line_start"], symbol=f"{simple_name}#{m['name']}")
+        )
+    scope = "class-level" if class_level else f"{len(methods)} method(s)"
+    return _finding(
+        "transaction_boundary", fqn,
+        f"Manages transaction boundaries ({scope})", "high", evidence,
+        limitation_codes=["spring_proxies"],
+    )
+
+
+def _structural_findings(conn, class_id, fqn, simple_name, file_path) -> list[dict]:
+    """Surface structural smells already detected for this class (god_class, etc.)."""
+    out: list[dict] = []
+    for r in conn.execute(
+        "SELECT kind, description FROM finding WHERE class_id = ? ORDER BY kind", (class_id,)
+    ):
+        out.append(
+            _finding(
+                r["kind"], fqn, r["description"], "medium",
+                [ev("structure", r["description"], file_path=file_path, symbol=simple_name, source="structure")],
+                limitation_codes=["no_call_graph"],
+            )
+        )
+    return out
+
 
 def _resolve_class(conn: sqlite3.Connection, name: str) -> sqlite3.Row | None:
     row = conn.execute("SELECT * FROM v_class_full WHERE fqn = ?", (name,)).fetchone()
@@ -63,6 +144,11 @@ def explain_class(conn: sqlite3.Connection, name: str) -> dict:
     )
     inferred_findings = [layer_finding]
 
+    tx = _transaction_finding(conn, class_id, fqn, cls["simple_name"], cls["file_path"])
+    if tx is not None:
+        inferred_findings.append(tx)
+    inferred_findings.extend(_structural_findings(conn, class_id, fqn, cls["simple_name"], cls["file_path"]))
+
     # --- related symbols --------------------------------------------------
     injected = []
     for r in conn.execute(
@@ -83,7 +169,13 @@ def explain_class(conn: sqlite3.Connection, name: str) -> dict:
         "WHERE mc.caller_class_id = ? ORDER BY mc.line",
         (class_id,),
     ):
-        target_type = _simple_type(r["receiver_type_fqn"]) or r["receiver_field"]
+        if r["receiver_field"] is None:
+            # same-class self-call (helper delegation): receiver is this class
+            target_type = _simple_type(r["receiver_type_fqn"]) or cls["simple_name"]
+            desc = f"{cls['simple_name']}#{r['caller']} calls {r['callee_name']}() (same class)"
+        else:
+            target_type = _simple_type(r["receiver_type_fqn"]) or r["receiver_field"]
+            desc = f"{cls['simple_name']}#{r['caller']} calls {r['receiver_field']}.{r['callee_name']}()"
         called.append(
             {
                 "symbol": f"{target_type}#{r['callee_name']}",
@@ -93,7 +185,7 @@ def explain_class(conn: sqlite3.Connection, name: str) -> dict:
                 "evidence": [
                     ev(
                         "method_call",
-                        f"{cls['simple_name']}#{r['caller']} calls {r['receiver_field']}.{r['callee_name']}()",
+                        desc,
                         file_path=cls["file_path"],
                         line_start=r["line"],
                         symbol=f"{cls['simple_name']}#{r['caller']}",
@@ -103,6 +195,7 @@ def explain_class(conn: sqlite3.Connection, name: str) -> dict:
         )
 
     endpoints = []
+    endpoint_purpose_findings: list[dict] = []
     for r in conn.execute(
         "SELECT id, http_method, full_path, handler_name FROM v_endpoint_full "
         "WHERE controller_fqn = ? ORDER BY full_path",
@@ -112,14 +205,29 @@ def explain_class(conn: sqlite3.Connection, name: str) -> dict:
         evidence = (
             _fact_evidence(facts, "mapping_annotation", handler_subject) if handler_subject else []
         )
+        purpose = _endpoint_purpose(r["http_method"], r["handler_name"])
         endpoints.append(
             {
                 "http_method": r["http_method"],
                 "path": r["full_path"],
                 "handler": r["handler_name"],
+                "purpose": purpose,
                 "evidence": evidence,
             }
         )
+        if len(endpoint_purpose_findings) < _MAX_ENDPOINT_FINDINGS:
+            ep_evidence = evidence or [
+                ev("mapping_annotation", f"{r['http_method']} {r['full_path']}",
+                   file_path=cls["file_path"], symbol=handler_subject or fqn)
+            ]
+            endpoint_purpose_findings.append(
+                _finding(
+                    "endpoint_purpose", handler_subject or fqn,
+                    f"{r['http_method']} {r['full_path']} — {purpose}", "medium",
+                    ep_evidence, limitation_codes=["dynamic_endpoints"],
+                )
+            )
+    inferred_findings.extend(endpoint_purpose_findings)
 
     return {
         "class": {

@@ -154,6 +154,8 @@ def _persist_class(
 
     # field name -> declared type, used to resolve call receivers (controller -> service)
     field_types = {f.name: f.type_fqn for f in pc.fields}
+    # method names of this class, used to record same-class self-calls (helper hops)
+    own_methods = {mm.name for mm in pc.methods}
 
     for m in pc.methods:
         method_id = repo.insert_method(
@@ -175,13 +177,23 @@ def _persist_class(
             repo.insert_method_parameter(conn, method_id, p.position, p.name, p.type_fqn, commit=False)
         stats.methods += 1
 
-        # persist only calls whose receiver is a field of this class (deterministic,
-        # bounded): these are the controller->service->repository hops trace needs.
+        # Persist two kinds of intra-class call that trace follows (deterministic,
+        # bounded):
+        #   1. calls on a field of this class (controller -> service -> repo hops);
+        #   2. same-class self-calls (``this.helper()`` / ``helper()``) so trace can
+        #      step one level into a delegating helper. Self-calls carry a NULL
+        #      receiver_field and the class's own FQN as receiver_type_fqn.
         seen_calls: set[tuple[str, str]] = set()
         for call in m.calls:
-            if call.receiver is None or call.receiver not in field_types:
+            if call.receiver is not None and call.receiver in field_types:
+                receiver_field = call.receiver
+                receiver_type = field_types[call.receiver]
+            elif call.receiver in (None, "this") and call.name in own_methods and call.name != m.name:
+                receiver_field = None
+                receiver_type = pc.fqn
+            else:
                 continue
-            key = (call.receiver, call.name)
+            key = (receiver_field or "self", call.name)
             if key in seen_calls:
                 continue
             seen_calls.add(key)
@@ -190,8 +202,8 @@ def _persist_class(
                 caller_method_id=method_id,
                 caller_class_id=class_id,
                 callee_name=call.name,
-                receiver_field=call.receiver,
-                receiver_type_fqn=field_types[call.receiver],
+                receiver_field=receiver_field,
+                receiver_type_fqn=receiver_type,
                 line=call.line,
                 commit=False,
             )
