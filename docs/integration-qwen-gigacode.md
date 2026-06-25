@@ -182,7 +182,7 @@ curl -sL https://<your-release-url>/legacy-reverse-gigacode.zip | bsdtar -xvf - 
 ### 3.1. Через CLI
 
 ```bash
-qwen mcp list        # ожидаем: legacy-reverse — connected, 9 tools
+qwen mcp list        # ожидаем: legacy-reverse — connected, 12 tools
 # в интерактивной сессии:
 /mcp                 # показывает сервер и список инструментов
 ```

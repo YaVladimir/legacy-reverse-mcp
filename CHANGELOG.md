@@ -39,6 +39,32 @@ deterministic; no LLM calls in tests.
   `current-state.md`; README rewritten.
 - **Tests**: first real pytest suite (`tests/`), pytest added as a `dev` extra.
 
+#### Accuracy & coverage passes (phases A–E)
+- **Type resolution via imports** (A): type references are resolved through a
+  file's imports to FQNs, so `class_dependency` edges are matched on FQN and the
+  count of false `ambiguous_simple_name` edges drops.
+- **Hand-written constructor injection** (B): a constructor that assigns its
+  parameters to `final` fields now marks those fields injected, even without
+  Lombok.
+- **CI + persisted inferences** (C): GitHub Actions workflow; low-confidence
+  layer findings are persisted to `inferred_findings` during scan.
+- **Config indexing** (D): `scanner/config_scanner.py` indexes
+  `application*.{yml,yaml,properties}` and `bootstrap*.*` into `config_file` /
+  `config_property` — nested YAML flattened to dotted keys, per-file profile from
+  the filename, secret-bearing keys flagged. Scan summary gains config counts; the
+  baseline report gains a **Config / profiles** section and a config-derived
+  `external_service_urls` signal (kept separate from the code-based
+  `external_clients` count; infra URLs filtered, embedded creds masked). New MCP
+  **`get_config`** (secret values masked on read; the index stays raw).
+- **Richer explain + same-class trace hop** (E): `explain_class` adds inferred
+  findings (each with evidence) for `@Transactional` boundaries, per-endpoint
+  purpose (verb + handler), and reuse of structural smells
+  (`god_class`/`large_controller`). The parser also records same-class self-calls,
+  and `trace_endpoint` steps one level into a delegating helper
+  (`controller_helper`) to reach the service. New MCP **`get_class_summary`** over
+  the deterministic `summarize_class` seam.
+- **Limitation codes**: added `config_not_resolved`.
+
 ### Changed
 - `explain_class` / `trace_endpoint` / `get_change_impact` /
   `generate_context_pack` now return the evidence-based contracts above (their
@@ -63,5 +89,8 @@ deterministic; no LLM calls in tests.
 ### Notes
 - Reports live under `.reverse/reports/` (alongside the existing `.reverse` index)
   rather than a second `.legacy-reverse/` directory; the path is a parameter.
-- Verified on Apache Fineract (~5.3k classes): ~48k observed facts + evidence,
-  scan ≈ 20 s; full pytest suite and golden questions green.
+- Verified on Apache Fineract (~5.3k classes): ~51k observed facts + evidence,
+  scan ≈ 23 s; full pytest suite and golden questions green.
+- D/E on Fineract: 11 config files / 911 properties / 2 profiles indexed (no
+  secrets leak into the report); intra-class calls 15.4k → 23.2k; trace reaches a
+  service/repository on 939/974 endpoints, using the same-class helper hop on 85.

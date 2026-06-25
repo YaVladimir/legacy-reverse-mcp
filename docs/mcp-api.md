@@ -62,8 +62,9 @@ method/path. Example (fixture, `POST /deposits/create`):
 }
 ```
 
-Step `kind`s: `controller_method`, `service_call` (high) / `likely_service`
-(medium), `repository_call` (high) / `likely_repository` (medium), `persistence`.
+Step `kind`s: `controller_method`, `controller_helper` (high; same-class
+delegation hop), `service_call` (high) / `likely_service` (medium),
+`repository_call` (high) / `likely_repository` (medium), `persistence`.
 Not found → structured error with a sample of endpoints as `suggestions`.
 
 ### `get_change_impact(symbol)`
@@ -105,3 +106,22 @@ an empty, explained pack with a `warning`.
 ### `get_module_map()` / `get_project_overview()` / `find_code_areas(query, limit)`
 Structured inventory/search results, each annotated with `confidence` +
 `limitations`.
+
+### `get_findings(subject?, finding_type?, limit=200)`
+Inferred findings persisted during scan (e.g. low-confidence layer guesses), each
+with evidence + confidence. `{ count, findings: [...], confidence: "low",
+limitations, warnings }`.
+
+### `get_config(key_contains?, profile?, limit=200)`
+Spring config indexed from `application*.{yml,properties}` and `bootstrap*.*`.
+`{ config_file_count, files: [{file_path, kind, profile, module_name,
+property_count}], property_count, properties: [{key, value, is_secret, file_path,
+profile}], confidence: "high", limitations, warnings }`. Secret-bearing values
+(`password`/`secret`/`token`/…) are masked (`***`); the index keeps them raw.
+Static read — `${...}` placeholders are not resolved (`config_not_resolved`).
+
+### `get_class_summary(fqn)`
+Deterministic one-line summary (role, module, endpoints, injected deps, method
+count). Accepts FQN or simple name. `{ fqn, name, summary, confidence: "medium",
+limitations, warnings }`. The `summarize_class` seam is where an LLM-backed summary
+can later be swapped in. Not found → structured error with `suggestions`.

@@ -87,6 +87,9 @@ Every heuristic tool returns a structured response carrying `confidence`,
 | `get_module_map()` | Modules, inter-module deps, external coordinates, endpoint counts |
 | `get_project_overview()` | Stack, totals, role distribution, top modules, findings |
 | `find_code_areas(query, limit)` | FTS keyword search over classes/methods/endpoints |
+| `get_findings(subject, finding_type, limit)` | Inferred findings persisted during scan, each with evidence + confidence |
+| `get_config(key_contains, profile, limit)` | Spring config (`application*`/`bootstrap*`) — files + properties; secret values masked |
+| `get_class_summary(fqn)` | Deterministic one-line class summary (LLM-swappable `summarize_class` seam) |
 
 ## Interpreting confidence
 

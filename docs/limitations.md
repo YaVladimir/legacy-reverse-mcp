@@ -12,20 +12,25 @@ agent can react to them.
 - **No runtime Spring resolution.** Proxies, AOP advice, `@Profile`/`@Conditional`
   beans, `@Bean` factory methods and dynamic wiring are not resolved
   (`spring_proxies`).
-- **No full polymorphic call graph.** Calls are extracted **syntactically** and
-  only for receivers that are fields of the class; interface dispatch, lambdas and
-  reflection are approximated or missed (`syntactic_calls`, `no_call_graph`).
+- **No full polymorphic call graph.** Calls are extracted **syntactically** for
+  receivers that are fields of the class, plus same-class self-calls; a trace
+  follows at most **one** same-class helper hop. Interface dispatch, lambdas,
+  reflection and deeper delegation chains are approximated or missed
+  (`syntactic_calls`, `no_call_graph`).
 - **No data-flow analysis.** The tool does not track values, nullability or taint.
 
 ## Resolution / heuristic boundaries
 
 - **Interface → implementation** is resolved by naming convention (`*Impl`), not
   JDT/bytecode (`interface_impl_unresolved`).
-- **Type matching is by simple name**, so ambiguous names over-approximate — it
-  links all candidates rather than miss one (`ambiguous_simple_name`).
-- **Constructor injection** is detected via Lombok
-  `@RequiredArgsConstructor`/`@AllArgsConstructor` or explicit field-injection
-  annotations; a hand-written constructor over a `final` field may be missed
+- **Type references are resolved via imports to FQNs** where possible. Only types
+  that stay unresolved (no matching import, or wildcard imports) fall back to
+  simple-name matching, which over-approximates — linking all candidates rather
+  than missing one (`ambiguous_simple_name`).
+- **Constructor injection** is detected for Lombok
+  `@RequiredArgsConstructor`/`@AllArgsConstructor`, explicit field-injection
+  annotations, and hand-written constructors that assign parameters to `final`
+  fields; exotic wiring (builders, conditional assignment) may still be missed
   (`ctor_injection_without_lombok`).
 - **Endpoints are annotation-only**; dynamic/programmatic registration is not
   supported (`dynamic_endpoints`).
@@ -33,6 +38,10 @@ agent can react to them.
   (`tests_not_indexed`).
 - **External/library types are not resolved** to a definition
   (`external_types_unresolved`).
+- **Configuration is read statically.** `application*.{yml,properties}` and
+  `bootstrap*.*` are parsed as-is: `${...}` placeholders are not resolved and
+  profile activation / import / override precedence is not computed; secret-bearing
+  values are masked in outward-facing output (`config_not_resolved`).
 
 ## Consequence: false positives are possible
 
