@@ -1,5 +1,7 @@
 # legacy-reverse-mcp
 
+**English** · [Русский](README.ru.md)
+
 `legacy-reverse-mcp` is a **source-first** MCP server for understanding legacy
 **Java / Spring** backends quickly. It helps a developer or an LLM agent find
 REST endpoints, Spring/JAX-RS layers, dependency-injection wiring, heuristic
