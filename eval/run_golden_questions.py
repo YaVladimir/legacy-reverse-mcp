@@ -45,6 +45,10 @@ def call_tool(conn, tool: str, inp: dict):
         return {"count": len(rows), "endpoints": rows}
     if tool == "find_code_areas":
         return queries.find_code_areas(conn, inp.get("query", ""))
+    if tool == "find_feature":
+        return queries.find_feature(conn, inp.get("topic", ""))
+    if tool == "get_class_card":
+        return queries.class_card(conn, inp["class"]) or {"error": "not_found"}
     if tool == "explain_class":
         return explain_class(conn, inp["class"])
     if tool == "trace_endpoint":

@@ -42,12 +42,18 @@ def render_class_summary(
 
 
 def summarize_class(conn: sqlite3.Connection, class_id: int) -> str:
-    """On-demand summary for a single class (exposed via the get_class_summary MCP tool)."""
+    """On-demand summary for a single class (exposed via the get_class_summary MCP tool).
+
+    Prefers a stored description (the live seam: an LLM-generated description from
+    the ``describe`` step, if present); otherwise renders deterministically.
+    """
     from index.queries import class_detail
 
-    cls = conn.execute("SELECT fqn FROM class WHERE id = ?", (class_id,)).fetchone()
+    cls = conn.execute("SELECT fqn, summary FROM class WHERE id = ?", (class_id,)).fetchone()
     if cls is None:
         return ""
+    if cls["summary"]:
+        return cls["summary"]
     d = class_detail(conn, cls["fqn"])
     if d is None:
         return ""

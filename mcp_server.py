@@ -8,6 +8,7 @@ The index lives at ``<repo>/.reverse/index.sqlite3``.
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 
@@ -128,6 +129,155 @@ def get_class_summary(fqn: str) -> dict:
         confidence="medium",  # deterministic rendering over a heuristic role
         limitation_codes=["spring_proxies"],
     )
+
+
+@mcp.tool()
+def generate_descriptions(force: bool = False, no_llm: bool = False) -> dict:
+    """Generate meaningful natural-language descriptions for every class and method
+    (and the package/module/project hierarchy) over the already-built index, so the
+    other tools can return *what code does and why*, not just its structure.
+
+    Uses a pluggable LLM configured via LEGACY_REVERSE_LLM_* env vars; with no
+    endpoint configured (or no_llm=true) it writes deterministic fallback text.
+    Results are cached by content hash in .reverse/descriptions.sqlite3 so re-runs
+    are cheap. Run this once after scan_repository (it can take a while on big repos)."""
+    from summarizer.describe import describe_repo
+
+    repo = _resolve_repo()
+    db = _db_path(repo)
+    if not db.exists():
+        raise RuntimeError(f"Index not found at {db}. Run scan_repository first.")
+    conn = get_conn(db)
+    try:
+        stats = describe_repo(conn, str(repo), force=force, use_llm=not no_llm)
+    finally:
+        conn.close()
+    return meta(
+        {"status": "described", **stats},
+        confidence="medium",  # descriptions are model/heuristic text over high-confidence structure
+        limitation_codes=["spring_proxies"],
+    )
+
+
+@mcp.tool()
+def find_feature(topic: str, limit: int = 20, methods_per_class: int = 12) -> dict:
+    """Find the classes that implement a feature/topic (e.g. "банкротство / bankruptcy")
+    and return each as a compact card with its methods, parameters and descriptions —
+    so an agent can act without grep or reading files. Searches class and method names,
+    annotations AND generated descriptions (run generate_descriptions first for the best
+    recall, especially for business/Russian queries)."""
+    conn = _read_conn()
+    try:
+        result = queries.find_feature(conn, topic, limit=limit, methods_per_class=methods_per_class)
+    finally:
+        conn.close()
+    return meta(
+        result,
+        confidence="medium",
+        limitation_codes=["ambiguous_simple_name", "no_call_graph"],
+    )
+
+
+@mcp.tool()
+def get_class_card(fqn: str) -> dict:
+    """Full structured card for one class (reference-architecture parity): id, pkg,
+    name, description, type, kind, class_modifiers, extends, implements, fields and
+    methods (each with sig incl. parameter names, modifiers, annotations, description).
+    Accepts FQN or simple name. Structured not-found with suggestions otherwise."""
+    from analysis.common import not_found
+
+    conn = _read_conn()
+    try:
+        card = queries.class_card(conn, fqn)
+        if card is None:
+            suggestions = [
+                {"fqn": s["fqn"], "name": s["simple_name"]}
+                for s in conn.execute(
+                    "SELECT fqn, simple_name FROM class WHERE simple_name LIKE ? OR fqn LIKE ? "
+                    "ORDER BY simple_name LIMIT 5",
+                    (f"%{fqn}%", f"%{fqn}%"),
+                )
+            ]
+            return not_found("class", fqn, suggestions)
+    finally:
+        conn.close()
+    return meta(card, confidence="medium", limitation_codes=["spring_proxies"])
+
+
+@mcp.tool()
+def export_architecture(out_path: str | None = None) -> dict:
+    """Render the whole index as a flat architecture JSON — reference-schema parity
+    with the GigaCode architecture-generator (per class: id, pkg, name, description,
+    type, kind, class_modifiers, extends, implements, fields, methods[{sig, modifiers,
+    description}]). With out_path, writes the file and returns a summary; otherwise
+    returns the full architecture dict. Run generate_descriptions first to fill descriptions."""
+    from analysis.flat_arch import export_flat
+
+    repo = _resolve_repo()
+    db = _db_path(repo)
+    if not db.exists():
+        raise RuntimeError(f"Index not found at {db}. Run scan_repository first.")
+    conn = get_conn(db)
+    try:
+        data = export_flat(conn, str(repo))
+    finally:
+        conn.close()
+    if out_path:
+        Path(out_path).write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        return meta(
+            {"status": "written", "out_path": out_path,
+             "project": data["project"], "total_classes": data["total_classes"]},
+            confidence="high", limitation_codes=["spring_proxies"],
+        )
+    return meta({"status": "ok", **data}, confidence="high", limitation_codes=["spring_proxies"])
+
+
+@mcp.tool()
+def import_architecture(in_path: str) -> dict:
+    """Load descriptions from a flat architecture JSON (e.g. produced by the GigaCode
+    architecture-generator skill) into the index, so find_feature / get_class_card /
+    explain_class serve them and a later describe keeps them (imported wins). Matches
+    classes by pkg.name and methods by name (+ parameter types for overloads)."""
+    from analysis.flat_arch import import_flat
+    from analysis.common import not_found
+
+    repo = _resolve_repo()
+    db = _db_path(repo)
+    if not db.exists():
+        raise RuntimeError(f"Index not found at {db}. Run scan_repository first.")
+    p = Path(in_path)
+    if not p.exists():
+        return not_found("file", in_path, [])
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return {"error": "bad_input", "kind": "file", "query": in_path, "message": str(exc), "suggestions": []}
+    conn = get_conn(db)
+    try:
+        stats = import_flat(conn, str(repo), data)
+    finally:
+        conn.close()
+    return meta({"status": "imported", **stats}, confidence="medium", limitation_codes=["spring_proxies"])
+
+
+@mcp.tool()
+def generate_architecture() -> dict:
+    """Run gigacode-cli's architecture-generator skill and import its flat JSON,
+    configured via LEGACY_REVERSE_GIGACODE_* env vars. On failure returns a structured
+    error with a hint to run the skill manually and call import_architecture."""
+    from summarizer.harness import generate_architecture as _gen
+
+    repo = _resolve_repo()
+    db = _db_path(repo)
+    if not db.exists():
+        raise RuntimeError(f"Index not found at {db}. Run scan_repository first.")
+    conn = get_conn(db)
+    try:
+        stats = _gen(conn, str(repo))
+    finally:
+        conn.close()
+    conf = "medium" if stats.get("status") == "imported" else "low"
+    return meta(stats, confidence=conf, limitation_codes=["spring_proxies"])
 
 
 @mcp.tool()

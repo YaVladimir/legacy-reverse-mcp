@@ -238,6 +238,7 @@ def explain_class(conn: sqlite3.Connection, name: str) -> dict:
             "module": cls["module_name"],
             "kind": cls["kind"],
             "role": cls["role"],
+            "description": cls["summary"],  # meaningful description from the describe step
         },
         "observed_facts": facts,
         "inferred_findings": inferred_findings,

@@ -25,7 +25,7 @@ methods, endpoints, observed_facts, method_calls, ...}`.
 confidence: "high", limitations, warnings }`.
 
 ### `explain_class(fqn)`
-`{ class: {name, fqn, file_path, package, module, kind, role},
+`{ class: {name, fqn, file_path, package, module, kind, role, description},
 observed_facts: [...], inferred_findings: [{finding_type, subject, summary,
 confidence, evidence, limitations, layer}], related_symbols: {injected_dependencies,
 called_methods, endpoints}, confidence, limitations, warnings }`. Each inferred
@@ -121,7 +121,68 @@ profile}], confidence: "high", limitations, warnings }`. Secret-bearing values
 Static read — `${...}` placeholders are not resolved (`config_not_resolved`).
 
 ### `get_class_summary(fqn)`
-Deterministic one-line summary (role, module, endpoints, injected deps, method
-count). Accepts FQN or simple name. `{ fqn, name, summary, confidence: "medium",
-limitations, warnings }`. The `summarize_class` seam is where an LLM-backed summary
-can later be swapped in. Not found → structured error with `suggestions`.
+Class description. Returns the description produced by `describe`/`generate_descriptions`
+(LLM-generated when an endpoint is configured) if present, else a deterministic
+one-liner (role, module, endpoints, injected deps, method count). Accepts FQN or
+simple name. `{ fqn, name, summary, confidence: "medium", limitations, warnings }`.
+Not found → structured error with `suggestions`.
+
+### `generate_descriptions(force=False, no_llm=False)`
+Generates meaningful natural-language descriptions for every class and method (and
+the package/module/project hierarchy) over the already-built index, denormalised
+into `class.summary`/`method.summary` (so cards, `explain_class` and `find_feature`
+pick them up) and the `summary` table for the hierarchy. Uses a pluggable
+OpenAI-compatible LLM via `LEGACY_REVERSE_LLM_*` env vars; with no endpoint (or
+`no_llm=true`) it writes deterministic fallback text. Cached by content hash in
+`.reverse/descriptions.sqlite3` (survives `scan --force`); `force=true` ignores the
+cache. `{ status: "described", classes, methods, packages, modules, project,
+from_llm, from_cache, from_fallback, llm_enabled, model, search_rows, confidence,
+limitations, warnings }`. Run once after `scan_repository` (can be slow on large
+repos).
+
+### `find_feature(topic, limit=20, methods_per_class=12)`
+Topic/feature → the classes that implement it, each as a compact card **with its
+methods bundled**, so an agent needs no grep or file reads. Searches class and
+method names, annotations **and** generated descriptions (run `generate_descriptions`
+first for the best recall on business/Russian queries). `{ query, count, classes:
+[{ fqn, name, type, kind, module, file_path, description, matched_via:
+"class"|"method", methods: [{sig, modifiers, description, matched}] }], confidence:
+"medium", limitations, warnings }`. Matched methods are listed first within a card.
+
+### `get_class_card(fqn)`
+Full structured card for one class, parity with the reference architecture JSON.
+`{ id, fqn, pkg, name, description, type, kind, module, file_path, class_modifiers,
+extends, implements, annotations, fields: [{name, type, injected}], methods: [{sig,
+modifiers, description, annotations}], endpoints, confidence: "medium", limitations,
+warnings }`. `sig` includes parameter names (e.g. `createDeposit(DepositRequest
+req): Deposit`). Accepts FQN or simple name. Not found → structured error with
+`suggestions`.
+
+### `export_architecture(out_path?)`
+Render the whole index as a **flat architecture JSON** — drop-in parity with the GigaCode
+`architecture-generator` (`project_architecture_flat.json`). Top level `{project,
+generated_at, total_classes, classes}`; each class `{id, pkg, name, description, type,
+kind, class_modifiers, extends, implements, fields: [{name, type}], methods: [{sig,
+modifiers, description}]}` (`extends`/`implements` are `null` when absent; `id` is the
+repo-relative source path without `.java`). With `out_path` writes the file and returns
+`{status: "written", out_path, project, total_classes, ...}`; otherwise returns the full
+dict under `{status: "ok", ...}`. Run `generate_descriptions` first to populate descriptions.
+
+### `import_architecture(in_path)`
+Load descriptions from a flat architecture JSON (e.g. produced by the GigaCode skill) into
+the index. Classes match by `pkg.name` (fallback: simple name); methods by name (+ parameter
+type simple-names for overloads; parameter names and return type are ignored). Imported
+descriptions are written to `class.summary`/`method.summary` **and** a durable imported store,
+so they **win over LLM/fallback** in a later `describe` and survive re-scans. `{status:
+"imported", classes_total, classes_matched, methods_matched, methods_unmatched,
+unmatched_classes: [...], search_rows, confidence: "medium", limitations, warnings}`.
+Missing / non-JSON file → structured error.
+
+### `generate_architecture()`
+Run gigacode-cli's `architecture-generator` skill and import its flat JSON in one step,
+configured via `LEGACY_REVERSE_GIGACODE_*` env vars (`CMD`, `ARGS`, `PROMPT`, `OUTPUT`
+=`stdout`|file, `TIMEOUT`, `CWD`). GigaCode is a Gemini-CLI fork → headless `gigacode -p`.
+On success returns the `import_architecture` stats with `{status: "imported", source:
+"gigacode", ...}`; on failure (gigacode absent, timeout, unparseable output) returns
+`{status: "error", source: "gigacode", error, hint, ...}` — the hint points at the manual
+path (run the skill, then `import_architecture`). Never raises.

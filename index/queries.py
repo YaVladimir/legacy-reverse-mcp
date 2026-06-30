@@ -224,6 +224,65 @@ def module_map(conn: sqlite3.Connection) -> dict:
 # explain_class
 # ------------------------------------------------------------
 
+def _pretty_sig(name: str, params: list, return_type: str | None) -> str:
+    """`createDeposit(DepositRequest req): Deposit` — type + param name (reference format)."""
+    parts = []
+    for p in params:
+        t = p["type_fqn"] or "?"
+        parts.append(f"{t} {p['name']}" if p["name"] else t)
+    sig = f"{name}({', '.join(parts)})"
+    if return_type:
+        sig += f": {return_type}"
+    return sig
+
+
+def _class_modifiers(visibility: str | None, is_abstract) -> list[str]:
+    mods = [visibility] if visibility and visibility != "package-private" else []
+    if is_abstract:
+        mods.append("abstract")
+    return mods
+
+
+def _method_details(conn: sqlite3.Connection, class_id: int) -> list[dict]:
+    """Structured methods with parameter names, pretty signature, modifiers and
+    the generated description (``method.summary``)."""
+    methods = []
+    for m in conn.execute(
+        "SELECT id, name, signature, return_type, visibility, is_static, is_constructor, "
+        "line_start, line_end, summary FROM method WHERE class_id = ? ORDER BY line_start",
+        (class_id,),
+    ):
+        param_rows = conn.execute(
+            "SELECT name, type_fqn FROM method_parameter WHERE method_id = ? ORDER BY position",
+            (m["id"],),
+        ).fetchall()
+        params = [{"name": r["name"], "type": r["type_fqn"]} for r in param_rows]
+        anns = [
+            r["name"]
+            for r in conn.execute(
+                "SELECT name FROM method_annotation WHERE method_id = ?", (m["id"],)
+            )
+        ]
+        modifiers = " ".join(filter(None, [m["visibility"], "static" if m["is_static"] else ""])).strip()
+        methods.append(
+            {
+                "id": m["id"],
+                "name": m["name"],
+                "signature": m["signature"],
+                "sig": _pretty_sig(m["name"], param_rows, m["return_type"]),
+                "return_type": m["return_type"],
+                "modifiers": modifiers,
+                "parameters": params,
+                "annotations": anns,
+                "is_constructor": bool(m["is_constructor"]),
+                "line_start": m["line_start"],
+                "line_end": m["line_end"],
+                "description": m["summary"],
+            }
+        )
+    return methods
+
+
 def class_detail(conn: sqlite3.Connection, fqn: str) -> dict | None:
     cls = conn.execute("SELECT * FROM v_class_full WHERE fqn = ?", (fqn,)).fetchone()
     if cls is None:
@@ -234,7 +293,11 @@ def class_detail(conn: sqlite3.Connection, fqn: str) -> dict | None:
     if cls is None:
         return None
 
-    class_id = conn.execute("SELECT id FROM class WHERE fqn = ?", (cls["fqn"],)).fetchone()["id"]
+    core = conn.execute(
+        "SELECT id, visibility, is_abstract, superclass_fqn FROM class WHERE fqn = ?",
+        (cls["fqn"],),
+    ).fetchone()
+    class_id = core["id"]
 
     annotations = [
         dict(r)
@@ -259,21 +322,7 @@ def class_detail(conn: sqlite3.Connection, fqn: str) -> dict | None:
     injected = [
         {"name": f["name"], "type": f["type_fqn"]} for f in fields if f["is_injected"]
     ]
-    methods = []
-    for m in conn.execute(
-        "SELECT id, name, signature, return_type, visibility, line_start, line_end "
-        "FROM method WHERE class_id = ? ORDER BY line_start",
-        (class_id,),
-    ):
-        m_anns = [
-            r["name"]
-            for r in conn.execute(
-                "SELECT name FROM method_annotation WHERE method_id = ?", (m["id"],)
-            )
-        ]
-        md = dict(m)
-        md["annotations"] = m_anns
-        methods.append(md)
+    methods = _method_details(conn, class_id)
 
     endpoints = [
         dict(r)
@@ -288,12 +337,17 @@ def class_detail(conn: sqlite3.Connection, fqn: str) -> dict | None:
         "fqn": cls["fqn"],
         "simple_name": cls["simple_name"],
         "role": cls["role"],
+        "type": cls["role"],  # alias matching the reference architecture-JSON vocabulary
         "kind": cls["kind"],
         "module": cls["module_name"],
         "package": cls["package_fqn"],
         "file_path": cls["file_path"],
         "line_start": cls["line_start"],
         "summary": cls["summary"],
+        "description": cls["summary"],  # alias: the meaningful class description
+        "class_modifiers": _class_modifiers(core["visibility"], core["is_abstract"]),
+        "extends": core["superclass_fqn"],
+        "implements": interfaces,
         "annotations": annotations,
         "interfaces": interfaces,
         "injected_dependencies": injected,
@@ -301,6 +355,132 @@ def class_detail(conn: sqlite3.Connection, fqn: str) -> dict | None:
         "methods": methods,
         "endpoints": endpoints,
     }
+
+
+# ------------------------------------------------------------
+# get_class_card — reference-parity object (id/pkg/name/description/type/kind/
+# class_modifiers/extends/methods[sig,modifiers,description]/fields/implements)
+# ------------------------------------------------------------
+
+def class_card(conn: sqlite3.Connection, fqn: str) -> dict | None:
+    d = class_detail(conn, fqn)
+    if d is None:
+        return None
+    return {
+        "id": d["fqn"],
+        "fqn": d["fqn"],
+        "pkg": d["package"],
+        "name": d["simple_name"],
+        "description": d["description"],
+        "type": d["type"],
+        "kind": d["kind"],
+        "module": d["module"],
+        "file_path": d["file_path"],
+        "class_modifiers": d["class_modifiers"],
+        "extends": d["extends"],
+        "implements": d["implements"],
+        "annotations": d["annotations"],
+        "fields": [
+            {"name": f["name"], "type": f["type_fqn"], "injected": bool(f["is_injected"])}
+            for f in d["fields"]
+        ],
+        "methods": [
+            {
+                "sig": m["sig"],
+                "modifiers": m["modifiers"],
+                "description": m["description"],
+                "annotations": m["annotations"],
+            }
+            for m in d["methods"]
+        ],
+        "endpoints": d["endpoints"],
+    }
+
+
+# ------------------------------------------------------------
+# find_feature — topic -> ranked class cards with bundled methods (no grep)
+# ------------------------------------------------------------
+
+def _feature_method_cards(
+    conn: sqlite3.Connection, class_id: int, limit: int, matched_ids: set[int]
+) -> list[dict]:
+    methods = _method_details(conn, class_id)
+    # matched methods first, then source order; cap at `limit`
+    methods.sort(key=lambda m: (m["id"] not in matched_ids, m["line_start"] or 0))
+    out = []
+    for m in methods[:limit]:
+        out.append(
+            {
+                "sig": m["sig"],
+                "modifiers": m["modifiers"],
+                "description": m["description"],
+                "matched": m["id"] in matched_ids,
+            }
+        )
+    return out
+
+
+def find_feature(
+    conn: sqlite3.Connection, query: str, limit: int = 20, methods_per_class: int = 12
+) -> dict:
+    """Topic -> the classes that implement it, each as a compact card with its
+    methods, parameters and descriptions, so an agent skips grep + file reads.
+
+    Searches class names/annotations/descriptions AND method names/descriptions
+    (the FTS index now carries generated descriptions), then folds method hits up
+    to their owning class.
+    """
+    from index import search as search_mod
+
+    ranked_class_ids: list[int] = []
+    seen: set[int] = set()
+    direct_ids: set[int] = set()
+
+    # 1) direct class hits (name / annotations / description)
+    for h in search_mod.search(conn, query, limit=limit * 2, entity_type="class"):
+        cid = h["entity_id"]
+        direct_ids.add(cid)
+        if cid not in seen:
+            seen.add(cid)
+            ranked_class_ids.append(cid)
+
+    # 2) method hits -> their owning class (catches classes relevant via a method)
+    matched_methods: dict[int, set[int]] = {}
+    for h in search_mod.search(conn, query, limit=limit * 4, entity_type="method"):
+        row = conn.execute("SELECT id, class_id FROM method WHERE id = ?", (h["entity_id"],)).fetchone()
+        if row is None:
+            continue
+        matched_methods.setdefault(row["class_id"], set()).add(row["id"])
+        if row["class_id"] not in seen:
+            seen.add(row["class_id"])
+            ranked_class_ids.append(row["class_id"])
+
+    cards: list[dict] = []
+    for cid in ranked_class_ids[:limit]:
+        cls = conn.execute(
+            "SELECT cl.fqn, cl.simple_name, cl.role, cl.kind, cl.file_path, cl.summary, "
+            "mo.name AS module FROM class cl LEFT JOIN module mo ON mo.id = cl.module_id "
+            "WHERE cl.id = ?",
+            (cid,),
+        ).fetchone()
+        if cls is None:
+            continue
+        matched = matched_methods.get(cid, set())
+        cards.append(
+            {
+                "fqn": cls["fqn"],
+                "name": cls["simple_name"],
+                "type": cls["role"],
+                "kind": cls["kind"],
+                "module": cls["module"],
+                "file_path": cls["file_path"],
+                "description": cls["summary"],
+                "matched_via": "class" if cid in direct_ids else "method",
+                "methods": _feature_method_cards(conn, cid, methods_per_class, matched),
+            }
+        )
+
+    return {"query": query, "count": len(cards), "classes": cards}
 
 
 # ------------------------------------------------------------

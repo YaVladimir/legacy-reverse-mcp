@@ -32,6 +32,24 @@ questions:
     items_field: classes
     expected_min_items: 1
 
+  - id: find-feature-deposit
+    question: "Найди фичу «депозит»: какие классы её реализуют и какие у них методы?"
+    tool: find_feature
+    input:
+      topic: "deposit"
+    items_field: classes
+    expected_min_items: 3
+    # proves the cards bundle method signatures (no grep needed downstream)
+    expected_contains: ["createDeposit", "methods"]
+
+  - id: class-card-controller
+    question: "Дай полную карточку класса DepositController (структура + описание)."
+    tool: get_class_card
+    input:
+      class: "DepositController"
+    expected_fields: ["id", "type", "kind", "class_modifiers", "extends", "implements", "methods", "fields"]
+    expected_contains: ["DepositRequest req"]
+
   - id: explain-controller
     question: "Что делает DepositController и на чём это основано?"
     tool: explain_class

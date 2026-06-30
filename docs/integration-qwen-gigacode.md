@@ -28,6 +28,50 @@
    ./.venv/Scripts/python.exe cli.py scan --repo "C:/Users/Iakovenko/IdeaProjects/fineract" --force
    ```
    Индекс пишется в `C:/Users/Iakovenko/IdeaProjects/fineract/.reverse/index.sqlite3`.
+3. **(Рекомендуется) Сгенерированы описания** — смысловой слой (Phase 2), чтобы
+   `get_class_card`/`find_feature`/`explain_class` отдавали «что и зачем», а не только структуру:
+   ```bash
+   ./.venv/Scripts/python.exe cli.py describe --repo "C:/Users/Iakovenko/IdeaProjects/fineract"
+   ```
+   Описания пишет подключаемый OpenAI-совместимый LLM, настраиваемый переменными
+   окружения; без endpoint (или с `--no-llm`) пишется детерминированный fallback:
+
+   | Переменная | По умолчанию | Назначение |
+   |------------|--------------|-----------|
+   | `LEGACY_REVERSE_LLM_BASE_URL` | *(пусто → LLM выключен)* | напр. `http://localhost:11434/v1` (Ollama), vLLM, llama.cpp |
+   | `LEGACY_REVERSE_LLM_MODEL` | `qwen3-coder-next` | имя модели |
+   | `LEGACY_REVERSE_LLM_API_KEY` | *(нет)* | опциональный токен |
+   | `LEGACY_REVERSE_LLM_LANG` | `ru` | язык описаний |
+
+   Кеш описаний — `<repo>/.reverse/descriptions.sqlite3` (переживает `scan --force`).
+   Можно также запустить через MCP-инструмент `generate_descriptions`.
+4. **(Опц.) Плоский JSON и gigacode-харнес.** Источник описаний по умолчанию — ваш
+   gigacode-скилл `architecture-generator`: он генерит `project_architecture_flat.json`,
+   а наш тул его импортирует (импортированные описания приоритетнее LLM/fallback и
+   переживают ре-скан):
+   ```bash
+   # харнес: запустить скилл и импортировать его JSON одним шагом
+   ./.venv/Scripts/python.exe cli.py generate-arch --repo "C:/.../fineract"
+   # или вручную: ваш скилл создал arch.json → импортируем
+   ./.venv/Scripts/python.exe cli.py import-arch --repo "C:/.../fineract" --in arch.json
+   # экспорт нашего индекса в тот же формат (паритет с эталоном)
+   ./.venv/Scripts/python.exe cli.py export-arch --repo "C:/.../fineract" --out arch.json
+   ```
+   gigacode — форк Gemini CLI (headless `gigacode -p "<prompt>"`). Инвокация
+   конфигурируется (точный триггер скилла/путь вывода знаете только вы на рабочей машине):
+
+   | Переменная | По умолчанию | Назначение |
+   |------------|--------------|-----------|
+   | `LEGACY_REVERSE_GIGACODE_CMD` | `gigacode` | бинарь CLI (ищется в PATH) |
+   | `LEGACY_REVERSE_GIGACODE_ARGS` | `-p` | флаги перед промптом (через пробел) |
+   | `LEGACY_REVERSE_GIGACODE_PROMPT` | запрос запустить `architecture-generator` и вывести JSON | промпт / триггер скилла |
+   | `LEGACY_REVERSE_GIGACODE_OUTPUT` | `stdout` | `stdout` или путь к JSON-файлу, который пишет скилл |
+   | `LEGACY_REVERSE_GIGACODE_TIMEOUT` | `900` | секунды |
+   | `LEGACY_REVERSE_GIGACODE_CWD` | репозиторий | рабочий каталог скилла |
+
+   MCP-инструменты: `export_architecture`, `import_architecture`, `generate_architecture`.
+   Если gigacode не установлен/не залогинен — `generate-arch` вернёт понятную ошибку с
+   подсказкой про ручной путь (`import-arch`).
 
 ### Параметры запуска (эта машина)
 
@@ -182,7 +226,7 @@ curl -sL https://<your-release-url>/legacy-reverse-gigacode.zip | bsdtar -xvf - 
 ### 3.1. Через CLI
 
 ```bash
-qwen mcp list        # ожидаем: legacy-reverse — connected, 12 tools
+qwen mcp list        # ожидаем: legacy-reverse — connected, 18 tools
 # в интерактивной сессии:
 /mcp                 # показывает сервер и список инструментов
 ```
@@ -201,11 +245,14 @@ printf '%s\n' \
 | LEGACY_REVERSE_REPO="C:/Users/Iakovenko/IdeaProjects/fineract" ./.venv/Scripts/python.exe mcp_server.py
 ```
 
-Проверенный результат на этой машине — сервер вернул **9 инструментов**:
+Проверенный результат на этой машине — сервер вернул **18 инструментов**:
 
 ```
-explain_class, find_code_areas, generate_context_pack, get_change_impact,
-get_module_map, get_project_overview, list_endpoints, scan_repository, trace_endpoint
+explain_class, export_architecture, find_code_areas, find_feature,
+generate_architecture, generate_context_pack, generate_descriptions,
+get_change_impact, get_class_card, get_class_summary, get_config, get_findings,
+get_module_map, get_project_overview, import_architecture, list_endpoints,
+scan_repository, trace_endpoint
 ```
 
 ### 3.3. Через агента
