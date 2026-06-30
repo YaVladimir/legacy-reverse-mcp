@@ -99,6 +99,81 @@ The scan writes the index and baseline reports into the target repo:
 Use `--force` to rebuild an existing index. Use `--resolve` only when you want
 Gradle dependency versions resolved and the target project has a working build.
 
+### 2b. Generate descriptions (optional but recommended)
+
+`scan` builds the *structural* index fast. The `describe` step then adds the
+*meaning*: a concise natural-language description of what each class and method
+does and why, plus package/module/project summaries. These descriptions power
+`get_class_card`, enrich `explain_class`, and (because they are indexed for
+search) make `find_feature` answer business/Russian topic queries.
+
+```bash
+./.venv/bin/legacy-reverse describe --repo /path/to/java-project
+```
+
+```powershell
+.venv\Scripts\legacy-reverse.exe describe --repo C:\path\to\java-project
+```
+
+`describe` uses a **pluggable, OpenAI-compatible LLM** configured via environment
+variables. With no endpoint configured (or `--no-llm`) it writes solid
+deterministic descriptions instead, so it always works:
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `LEGACY_REVERSE_LLM_BASE_URL` | *(empty → LLM disabled)* | e.g. `http://localhost:11434/v1` (Ollama), vLLM, llama.cpp, LM Studio |
+| `LEGACY_REVERSE_LLM_MODEL` | `qwen3-coder-next` | model name |
+| `LEGACY_REVERSE_LLM_API_KEY` | *(none)* | optional bearer token |
+| `LEGACY_REVERSE_LLM_LANG` | `ru` | language of generated descriptions |
+| `LEGACY_REVERSE_LLM_TIMEOUT` / `_MAX_TOKENS` / `_TEMPERATURE` | `60` / `512` / `0.1` | request tuning |
+
+Descriptions are cached by content hash in `<repo>/.reverse/descriptions.sqlite3`,
+which survives `scan --force`, so re-runs only re-describe changed code. Pass
+`--force` to ignore the cache. You can also trigger it over MCP with
+`generate_descriptions`.
+
+### 2c. Flat architecture JSON — export / import / gigacode
+
+The index can be rendered to (and loaded from) a **flat architecture JSON** that is a
+drop-in for the GigaCode `architecture-generator` output (`project_architecture_flat.json`):
+per class `{id, pkg, name, description, type, kind, class_modifiers, extends, implements,
+fields, methods:[{sig, modifiers, description}]}`.
+
+```bash
+# produce the flat JSON from our index
+legacy-reverse export-arch --repo /path/to/java-project --out arch.json
+
+# load descriptions from a flat JSON (e.g. produced by GigaCode) back into the index
+legacy-reverse import-arch --repo /path/to/java-project --in arch.json
+```
+
+Imported descriptions win over LLM/fallback and survive re-scans, so the recommended
+"meaning" source is your GigaCode skill: it produces the JSON, we import it.
+
+**gigacode harness.** `generate-arch` runs the GigaCode skill for you and imports the
+result in one step:
+
+```bash
+legacy-reverse generate-arch --repo /path/to/java-project
+```
+
+GigaCode CLI is a Gemini-CLI fork → headless `gigacode -p "<prompt>"`. The invocation is
+fully env-configurable, because the exact skill trigger / output path is only known on
+your work machine:
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `LEGACY_REVERSE_GIGACODE_CMD` | `gigacode` | CLI binary (resolved on PATH) |
+| `LEGACY_REVERSE_GIGACODE_ARGS` | `-p` | flags before the prompt (space-separated) |
+| `LEGACY_REVERSE_GIGACODE_PROMPT` | request to run `architecture-generator` and print JSON | the prompt / skill trigger |
+| `LEGACY_REVERSE_GIGACODE_OUTPUT` | `stdout` | `stdout`, or a path to the JSON file the skill writes |
+| `LEGACY_REVERSE_GIGACODE_TIMEOUT` | `900` | seconds |
+| `LEGACY_REVERSE_GIGACODE_CWD` | the repo | working dir for the skill |
+
+If gigacode isn't installed/authenticated, `generate-arch` reports a clear error — run the
+skill manually and use `import-arch --in <file>`. Over MCP: `export_architecture`,
+`import_architecture`, `generate_architecture`.
+
 ### 3. Run the MCP server manually
 
 Before wiring the server into an MCP client, run it once by hand. Use absolute
@@ -314,6 +389,10 @@ directory is in `PATH`, you can use the shorter command:
 
 ```bash
 legacy-reverse scan --repo /path/to/java-project [--force] [--resolve] [--report]
+legacy-reverse describe --repo /path/to/java-project [--force] [--no-llm]
+legacy-reverse export-arch --repo /path/to/java-project --out arch.json
+legacy-reverse import-arch --repo /path/to/java-project --in arch.json
+legacy-reverse generate-arch --repo /path/to/java-project
 legacy-reverse report --repo /path/to/java-project
 ```
 
@@ -356,7 +435,13 @@ Every heuristic tool returns a structured response carrying `confidence`,
 | `find_code_areas(query, limit)` | FTS keyword search over classes/methods/endpoints |
 | `get_findings(subject, finding_type, limit)` | Inferred findings persisted during scan, each with evidence + confidence |
 | `get_config(key_contains, profile, limit)` | Spring config (`application*`/`bootstrap*`): files + properties; secret values masked |
-| `get_class_summary(fqn)` | Deterministic one-line class summary |
+| `get_class_summary(fqn)` | Class description (LLM-generated if `describe` has run, else deterministic) |
+| `generate_descriptions(force, no_llm)` | Generate meaningful class/method/hierarchy descriptions over the index (LLM + deterministic fallback) |
+| `find_feature(topic, limit, methods_per_class)` | Topic/feature → ranked class cards **with their methods, parameters and descriptions** (no grep) |
+| `get_class_card(fqn)` | Full structured card for one class: id/pkg/name/description/type/kind/class_modifiers/extends/implements/fields/methods |
+| `export_architecture(out_path?)` | Render the index as a flat architecture JSON (reference schema, drop-in for the GigaCode generator) |
+| `import_architecture(in_path)` | Load descriptions from a flat architecture JSON into the index (imported wins over LLM/fallback) |
+| `generate_architecture()` | Run gigacode-cli's `architecture-generator` skill and import its flat JSON (configurable via env) |
 
 ## Interpreting confidence
 
@@ -400,13 +485,13 @@ macOS/Linux:
 ## Layout
 
 ```text
-cli.py                  CLI: scan (+ --report), report
+cli.py                  CLI: scan (+ --report), describe, report
 mcp_server.py           FastMCP server + tool registrations
 models/evidence.py      Evidence / Confidence / Limitation / ObservedFact / InferredFinding
 scanner/                repo + java parser, spring/endpoint scanners, fact emitter, indexer, pipeline
 index/                  schema.sql, repository (CRUD + facts), queries, search, findings
-analysis/               evidence-based tools: explain, trace, impact, context_pack, layers, report
-summarizer/             deterministic class/package summaries
+analysis/               evidence-based tools: explain, trace, impact, context_pack, layers, report, flat_arch (flat JSON export/import)
+summarizer/             llm.py (pluggable LLM client), describe.py (Phase-2 descriptions + cache), harness.py (gigacode-cli runner), deterministic class/package summaries
 eval/                   golden_questions.yaml, run_golden_questions.py, fixture/
 tests/                  pytest suite
 docs/                   mcp-api, confidence-model, evidence-model, limitations, golden-questions

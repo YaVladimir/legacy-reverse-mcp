@@ -617,6 +617,12 @@ def set_class_summary(conn: sqlite3.Connection, class_id: int, summary: str, com
         conn.commit()
 
 
+def set_method_summary(conn: sqlite3.Connection, method_id: int, summary: str, commit: bool = True) -> None:
+    conn.execute("UPDATE method SET summary = ? WHERE id = ?", (summary, method_id))
+    if commit:
+        conn.commit()
+
+
 def insert_summary(
     conn: sqlite3.Connection,
     kind: str,

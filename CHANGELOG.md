@@ -1,5 +1,67 @@
 # Changelog
 
+## Unreleased — flat architecture JSON (import/export) + gigacode harness
+
+Goal: interoperate with the GigaCode `architecture-generator` and let it be the
+description source. Round-trip the same `project_architecture_flat.json` schema, and
+run the skill via gigacode-cli.
+
+### Added
+- **Flat architecture export/import** (`analysis/flat_arch.py`):
+  - `export_flat` renders the index as the reference schema (`{project, generated_at,
+    total_classes, classes:[{id, pkg, name, description, type, kind, class_modifiers,
+    extends, implements, fields, methods:[{sig, modifiers, description}]}]}`) — a drop-in
+    for the GigaCode generator (reuses `class_detail`).
+  - `import_flat` loads descriptions back in: classes match by `pkg.name` (fallback simple
+    name), methods by name (+ parameter type simple-names for overloads). Writes
+    `class.summary`/`method.summary` + rebuilds FTS.
+- **Imported descriptions win** (`summarizer/describe.py`): new `imported_description`
+  table in `.reverse/descriptions.sqlite3`; `describe` consults it first (imported > LLM >
+  fallback) and it survives re-scans.
+- **gigacode harness** (`summarizer/harness.py`): runs the `architecture-generator` skill
+  via gigacode-cli (Gemini-CLI fork, headless `-p`; argv list, never `shell=True`; Windows
+  `.cmd` wrapping; env inherited) → flat JSON (stdout or file) → `import_flat`. Fully
+  configurable via `LEGACY_REVERSE_GIGACODE_*`; honest structured error + manual fallback
+  when gigacode/skill is absent.
+- **CLI**: `export-arch`, `import-arch`, `generate-arch`.
+- **MCP tools**: `export_architecture`, `import_architecture`, `generate_architecture`
+  (now 18 tools).
+- **Tests** (`tests/test_flat_arch.py`): export parity, export→import round-trip,
+  class/method matching, imported>fallback priority, harness (mocked subprocess), MCP
+  wiring. Verify: 88 pytest green, golden 11/11, stdio `tools/list` = 18.
+
+## Unreleased — Phase 2 meaning layer (descriptions + feature search)
+
+Goal: close the gap with the reference architecture JSON — emit not just structure
+but **meaning**. Every class/method gets a concise natural-language description of
+what it does and why, and an agent can go from a topic/feature straight to the
+relevant classes **with their methods and parameters**, no grep.
+
+### Added
+- **Pluggable LLM client** (`summarizer/llm.py`): zero-dependency, OpenAI-compatible
+  (`/v1/chat/completions`) over stdlib `urllib`. Configured via `LEGACY_REVERSE_LLM_*`
+  env vars; disabled (→ deterministic fallback) when no `BASE_URL` is set; never
+  raises into the pipeline.
+- **Describe pipeline** (`summarizer/describe.py`): offline, decoupled from `scan`.
+  Builds a compact per-class skeleton + source snippet, asks the LLM for class +
+  method descriptions (one JSON call per class), falls back to deterministic text,
+  and aggregates package/module/project summaries. Denormalised into
+  `class.summary`/`method.summary` (so cards + FTS use them) and the `summary` table.
+- **Durable description cache** (`<repo>/.reverse/descriptions.sqlite3`): keyed by a
+  stable content hash, **survives `scan --force`** so re-runs don't re-spend the LLM
+  budget; `--force` ignores it.
+- **Full structural surfacing** (`index/queries.py`): `class_detail` now returns
+  `extends`, `implements`, per-method `parameters` + pretty `sig` (with param names),
+  `class_modifiers`, `type` (alias of `role`) and `description`.
+- **New MCP tools** (+ CLI): `generate_descriptions`, `find_feature` (topic → ranked
+  class cards with bundled methods/params/descriptions), `get_class_card`
+  (reference-parity object). `legacy-reverse describe --repo … [--force] [--no-llm]`.
+  Now 15 MCP tools.
+- **`get_class_summary` / `explain_class`** now surface the generated description.
+- **FTS** indexes `method.summary`, so feature/business/Russian queries match meaning.
+- **Tests** (`tests/test_describe.py`) + golden questions `find-feature-deposit`,
+  `class-card-controller`. Verify: 80 pytest green, golden 11/11.
+
 ## Unreleased — provability & evidence layer
 
 Goal: keep the source-first MVP, but make every heuristic answer **honest** —

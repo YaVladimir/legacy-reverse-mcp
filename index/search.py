@@ -32,10 +32,10 @@ def build_search_index(conn: sqlite3.Connection) -> int:
         [(r["id"], r["simple_name"], r["fqn"], r["anns"], r["summary"] or "") for r in rows],
     )
 
-    # methods: fqn = ClassFqn#method
+    # methods: fqn = ClassFqn#method; summary (when described) makes meaning searchable
     rows = conn.execute(
         """
-        SELECT m.id, m.name, (cl.fqn || '#' || m.name) AS fqn,
+        SELECT m.id, m.name, (cl.fqn || '#' || m.name) AS fqn, m.summary,
                COALESCE(GROUP_CONCAT(ma.name, ' '), '') AS anns
         FROM method m
         JOIN class cl ON cl.id = m.class_id
@@ -45,8 +45,8 @@ def build_search_index(conn: sqlite3.Connection) -> int:
     )
     conn.executemany(
         "INSERT INTO search_index (entity_type, entity_id, name, fqn, annotations, summary) "
-        "VALUES ('method', ?, ?, ?, ?, '')",
-        [(r["id"], r["name"], r["fqn"], r["anns"]) for r in rows],
+        "VALUES ('method', ?, ?, ?, ?, ?)",
+        [(r["id"], r["name"], r["fqn"], r["anns"], r["summary"] or "") for r in rows],
     )
 
     # endpoints: name = full_path, annotations = http method
