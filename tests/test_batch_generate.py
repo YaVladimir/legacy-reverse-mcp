@@ -7,14 +7,20 @@ renames/invents classes must not smuggle descriptions onto wrong symbols).
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
+from analysis import flat_arch
+from index.repository import get_conn, init_db
+from scanner.pipeline import build_index
 from summarizer.batch_generate import (
     _chunk_classes,
     _chunk_prompt,
     _make_chunk_json,
     _validate_chunk_result,
+    main,
 )
+from tests.conftest import write_fixture_repo
 
 
 def _cls(i: int, described: bool = False) -> dict:
@@ -73,6 +79,44 @@ def test_validate_matches_by_pkg_name_when_id_missing():
     returned = {"classes": [{"pkg": "ru.bank", "name": "NoId", "description": "ок", "methods": []}]}
     accepted, info = _validate_chunk_result(sent, returned)
     assert len(accepted) == 1 and info["missing"] == []
+
+
+def test_merge_only_imports_outputs_from_disk(tmp_path, monkeypatch):
+    """--merge-only: no GigaCode at all — validate/merge/import out-chunk files
+    that another generator (e.g. a Claude agent) already wrote to the work dir."""
+    monkeypatch.delenv("LEGACY_REVERSE_LLM_BASE_URL", raising=False)
+    repo = write_fixture_repo(tmp_path / "repo")
+    db = repo / ".reverse" / "index.sqlite3"
+    conn = init_db(db)
+    build_index(conn, str(repo))
+
+    arch = flat_arch.export_flat(conn, str(repo))
+    conn.close()
+    arch_path = tmp_path / "arch.json"
+    arch_path.write_text(json.dumps(arch, ensure_ascii=False), encoding="utf-8")
+
+    # chunk-size 3 over 5 fixture classes -> chunks of 3 and 2; simulate an
+    # external agent describing every class of both chunks
+    chunks = _chunk_classes(arch["classes"], 3)
+    work_dir = repo / ".reverse" / "batch"
+    work_dir.mkdir(parents=True)
+    for i, ch in enumerate(chunks):
+        described = [dict(c, description=f"АГЕНТ: класс {c['name']}.") for c in ch]
+        out = _make_chunk_json(arch, described)
+        (work_dir / f"out-chunk-{i:04d}.json").write_text(
+            json.dumps(out, ensure_ascii=False), encoding="utf-8")
+
+    main([str(arch_path), "--repo", str(repo), "--merge-only",
+          "--chunk-size", "3", "--skip-describe"])
+
+    conn = get_conn(db)
+    row = conn.execute(
+        "SELECT summary FROM class WHERE simple_name = 'DepositController'").fetchone()
+    assert row["summary"] == "АГЕНТ: класс DepositController."
+    # merged artifact is preserved under .reverse/, outputs are not deleted
+    assert (repo / ".reverse" / "arch-merged.json").exists()
+    assert (work_dir / "out-chunk-0000.json").exists()
+    conn.close()
 
 
 def test_prompt_demands_reading_sources_and_forbids_invention():

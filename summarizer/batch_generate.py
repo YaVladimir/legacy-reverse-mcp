@@ -245,6 +245,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--no-import", action="store_true",
                         help="Skip importing into the index. NOTE: MCP tools read only the "
                              "index — without a later import-arch the agent sees nothing.")
+    parser.add_argument("--merge-only", action="store_true",
+                        help="Don't run GigaCode: validate/merge/import chunk outputs that are "
+                             "already in the work dir (out-chunk-NNNN.json, e.g. produced by "
+                             "another agent, or chunk-NNNN-stdout.txt sidecars).")
     parser.add_argument("--skip-describe", action="store_true",
                         help="Skip the post-import describe pass (it rebuilds package/module/"
                              "project summaries from the imported class descriptions).")
@@ -257,8 +261,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def main() -> None:  # noqa: C901 - linear orchestration script
-    args = parse_args()
+def main(argv: list[str] | None = None) -> None:  # noqa: C901 - linear orchestration script
+    args = parse_args(argv)
 
     # 1. load the full arch.json -------------------------------------------
     arch_path = Path(args.arch_json)
@@ -302,63 +306,78 @@ def main() -> None:  # noqa: C901 - linear orchestration script
     raw_args = args.gigacode_args or os.environ.get("LEGACY_REVERSE_GIGACODE_ARGS", "-p")
     gigacode_args = raw_args.split()
 
-    # 5. write chunk files ----------------------------------------------------
+    # 5/6. produce raw results: run GigaCode, or pick up outputs from disk ----
     project_name = original.get("project", "unknown")
-    for i, ch in enumerate(chunks):
-        path = work_dir / f"chunk-{i:04d}.json"
-        if args.resume and path.exists():
-            continue
-        _write_chunk(work_dir, i, _make_chunk_json(original, ch, project_name))
-    print(f"Chunk files ready in {work_dir}")
-
-    if not shutil.which(gigacode_cmd):
-        print(f"\n'{gigacode_cmd}' not found on PATH — chunk files are ready for manual processing.")
-        print(f"Run GigaCode on each chunk, then re-run with --resume {work_dir}")
-        return
-
-    # 6. run GigaCode concurrently -------------------------------------------
-    work_items: list[tuple[int, Path]] = []
-    skip_count = 0
-    for i in range(n_chunks):
-        chunk_path = work_dir / f"chunk-{i:04d}.json"
-        if args.resume:
-            out_path = work_dir / f"chunk-{i:04d}-stdout.txt"
-            if out_path.exists():
-                existing = _extract_json(out_path.read_text(encoding="utf-8", errors="replace"))
-                if existing and existing.get("classes"):
-                    skip_count += 1
-                    continue
-        work_items.append((i, chunk_path))
-    if skip_count:
-        print(f"Skipping {skip_count} already-completed chunk(s) (resume mode)")
-
-    print(f"Starting {len(work_items)} GigaCode session(s), {args.parallel} at a time ...\n")
-    progress = _Progress(len(work_items))
     raw_results: list[tuple[int, dict | None, dict]] = []
 
-    with ThreadPoolExecutor(max_workers=args.parallel) as pool:
-        future_map = {
-            pool.submit(_run_single_chunk, chunk_path, chunk_idx, n_chunks,
-                        gigacode_cmd, gigacode_args, args.timeout, cwd): chunk_idx
-            for chunk_idx, chunk_path in work_items
-        }
-        for fut in as_completed(future_map):
-            try:
-                result = fut.result()
-            except Exception as exc:  # noqa: BLE001 - keep the batch going
-                result = (future_map[fut], None, {"error": f"unexpected exception: {exc}"})
-            raw_results.append(result)
-            progress.tick(result[1] is not None)
-    print(progress.done_line())
+    if args.merge_only:
+        # outputs were produced elsewhere (another agent/model, manual gigacode
+        # runs): just read them back — out-chunk-NNNN.json first, then the
+        # gigacode sidecar chunk-NNNN-stdout.txt
+        print("Merge-only mode: reading existing chunk outputs from the work dir ...")
+        for i in range(n_chunks):
+            data = None
+            for candidate in (work_dir / f"out-chunk-{i:04d}.json",
+                              work_dir / f"chunk-{i:04d}-stdout.txt"):
+                if candidate.exists():
+                    data = _extract_json(candidate.read_text(encoding="utf-8", errors="replace"))
+                    if data:
+                        break
+            raw_results.append((i, data, {}))
+    else:
+        for i, ch in enumerate(chunks):
+            path = work_dir / f"chunk-{i:04d}.json"
+            if args.resume and path.exists():
+                continue
+            _write_chunk(work_dir, i, _make_chunk_json(original, ch, project_name))
+        print(f"Chunk files ready in {work_dir}")
 
-    # resumed chunks count as prior successes: re-read their sidecars
-    for i in range(n_chunks):
-        if not any(r[0] == i for r in raw_results):
-            out_path = work_dir / f"chunk-{i:04d}-stdout.txt"
-            if out_path.exists():
-                existing = _extract_json(out_path.read_text(encoding="utf-8", errors="replace"))
-                if existing:
-                    raw_results.append((i, existing, {"resumed": True}))
+        if not shutil.which(gigacode_cmd):
+            print(f"\n'{gigacode_cmd}' not found on PATH — chunk files are ready for manual processing.")
+            print(f"Run GigaCode on each chunk, then re-run with --resume {work_dir}")
+            return
+
+        work_items: list[tuple[int, Path]] = []
+        skip_count = 0
+        for i in range(n_chunks):
+            chunk_path = work_dir / f"chunk-{i:04d}.json"
+            if args.resume:
+                out_path = work_dir / f"chunk-{i:04d}-stdout.txt"
+                if out_path.exists():
+                    existing = _extract_json(out_path.read_text(encoding="utf-8", errors="replace"))
+                    if existing and existing.get("classes"):
+                        skip_count += 1
+                        continue
+            work_items.append((i, chunk_path))
+        if skip_count:
+            print(f"Skipping {skip_count} already-completed chunk(s) (resume mode)")
+
+        print(f"Starting {len(work_items)} GigaCode session(s), {args.parallel} at a time ...\n")
+        progress = _Progress(len(work_items))
+
+        with ThreadPoolExecutor(max_workers=args.parallel) as pool:
+            future_map = {
+                pool.submit(_run_single_chunk, chunk_path, chunk_idx, n_chunks,
+                            gigacode_cmd, gigacode_args, args.timeout, cwd): chunk_idx
+                for chunk_idx, chunk_path in work_items
+            }
+            for fut in as_completed(future_map):
+                try:
+                    result = fut.result()
+                except Exception as exc:  # noqa: BLE001 - keep the batch going
+                    result = (future_map[fut], None, {"error": f"unexpected exception: {exc}"})
+                raw_results.append(result)
+                progress.tick(result[1] is not None)
+        print(progress.done_line())
+
+        # resumed chunks count as prior successes: re-read their sidecars
+        for i in range(n_chunks):
+            if not any(r[0] == i for r in raw_results):
+                out_path = work_dir / f"chunk-{i:04d}-stdout.txt"
+                if out_path.exists():
+                    existing = _extract_json(out_path.read_text(encoding="utf-8", errors="replace"))
+                    if existing:
+                        raw_results.append((i, existing, {"resumed": True}))
 
     # 7. validate + merge -----------------------------------------------------
     merged_classes: list[dict] = []
@@ -429,7 +448,8 @@ def main() -> None:  # noqa: C901 - linear orchestration script
             conn.close()
 
     # 9. cleanup ---------------------------------------------------------------
-    keep = args.keep_chunks or bool(failed_chunks)
+    # merge-only outputs were produced by someone else — never delete them here
+    keep = args.keep_chunks or bool(failed_chunks) or args.merge_only
     if keep:
         print(f"Chunk files preserved in: {work_dir}")
     else:
