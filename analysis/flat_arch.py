@@ -47,8 +47,9 @@ _GENERIC = re.compile(r"<[^<>]*>")
 def _flat_id(file_path: str | None, fqn: str, repo_root: Path) -> str:
     if not file_path:
         return fqn
+    p = Path(file_path)
     try:
-        rel = Path(file_path).resolve().relative_to(repo_root).as_posix()
+        rel = p.as_posix() if not p.is_absolute() else p.resolve().relative_to(repo_root).as_posix()
     except (ValueError, OSError):
         return fqn
     return rel[:-5] if rel.endswith(".java") else rel

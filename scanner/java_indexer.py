@@ -279,7 +279,7 @@ def index_repo(
         rel = java_file.relative_to(repo_root)
         module_id = _resolve_module(str(rel), lookup)
         try:
-            parsed = parse_file(java_file)
+            parsed = parse_file(java_file, display_path=str(rel).replace("\\", "/"))
         except Exception as exc:  # noqa: BLE001 - keep scanning on any single-file failure
             stats.files_failed += 1
             stats.failures.append((str(rel), f"{type(exc).__name__}: {exc}"))

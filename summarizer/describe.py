@@ -239,14 +239,18 @@ def _class_skeleton(conn: sqlite3.Connection, class_id: int) -> dict:
     }
 
 
-def _source_snippet(skeleton: dict) -> str:
+def _source_snippet(skeleton: dict, repo_root: Path) -> str:
     """Per the manifest: small files whole; large files = headers + first lines of
-    each method body. Bounded so a 3B model is not flooded."""
+    each method body. Bounded so a 3B model is not flooded. ``file_path`` on the
+    skeleton is repo-relative; resolve it against ``repo_root`` to actually read it."""
     path = skeleton.get("file_path")
     if not path:
         return ""
+    full_path = Path(path)
+    if not full_path.is_absolute():
+        full_path = repo_root / full_path
     try:
-        lines = Path(path).read_text(encoding="utf-8", errors="replace").splitlines()
+        lines = full_path.read_text(encoding="utf-8", errors="replace").splitlines()
     except OSError:
         return ""
     if len(lines) <= _WHOLE_FILE_MAX_LINES:
@@ -410,9 +414,10 @@ def _describe_class(
     *,
     force: bool,
     stats: dict,
+    repo_root: Path,
 ) -> None:
     skeleton = _class_skeleton(conn, class_id)
-    snippet = _source_snippet(skeleton)
+    snippet = _source_snippet(skeleton, repo_root)
     model = llm.describe()
     lang = llm.config.lang
     ref_key = skeleton["fqn"]
@@ -551,6 +556,7 @@ def describe_repo(
     mode = f"LLM={llm.config.model}" if llm.enabled else "deterministic fallback (no LLM endpoint)"
     echo(f"Describing repository with {mode} ...")
 
+    repo_root = Path(repo_path).resolve()
     cache = _open_cache(repo_path)
     stats = {
         "classes": 0, "methods": 0, "packages": 0, "modules": 0, "project": 0,
@@ -560,7 +566,7 @@ def describe_repo(
     try:
         class_ids = [r["id"] for r in conn.execute("SELECT id FROM class ORDER BY fqn")]
         for i, class_id in enumerate(class_ids, 1):
-            _describe_class(conn, cache, class_id, llm, force=force, stats=stats)
+            _describe_class(conn, cache, class_id, llm, force=force, stats=stats, repo_root=repo_root)
             if progress_every and i % progress_every == 0:
                 conn.commit()
                 cache.commit()
