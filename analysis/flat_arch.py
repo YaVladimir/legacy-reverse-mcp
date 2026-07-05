@@ -173,6 +173,7 @@ def import_flat(
     if not classes:
         return stats
 
+    repo_root = Path(repo_path).resolve()
     cache = describe._open_cache(repo_path)
     try:
         for entry in classes:
@@ -208,9 +209,14 @@ def import_flat(
 
             if class_desc:
                 repo.set_class_summary(conn, class_id, class_desc, commit=False)
+            # structure hash at import time: a later `describe` ignores these rows
+            # once the class structurally changes, instead of serving stale text
+            skeleton = describe._class_skeleton(conn, class_id)
+            snippet = describe._source_snippet(skeleton, repo_root)
             describe.set_imported(
                 cache, class_fqn, class_text=class_desc or None, methods=method_map,
-                source=source, commit=False,
+                source=source, content_hash=describe.structure_hash(skeleton, snippet),
+                commit=False,
             )
             stats["classes_matched"] += 1
 

@@ -68,19 +68,26 @@ def _open_cache(repo_path: str | Path) -> sqlite3.Connection:
         """
     )
     # Imported descriptions (e.g. from a gigacode architecture-generator flat JSON).
-    # These take priority over LLM/fallback in describe, and survive re-scans.
+    # These take priority over LLM/fallback in describe, and survive re-scans —
+    # but only while ``content_hash`` still matches the class's current
+    # ``structure_hash`` (NULL = legacy import, always considered valid).
     # ref_key: "<fqn>" for a class, "<fqn>#<canonical_signature>" for a method.
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS imported_description (
-            ref_key     TEXT NOT NULL PRIMARY KEY,
-            kind        TEXT NOT NULL,   -- 'class' | 'method'
-            content     TEXT NOT NULL,
-            source      TEXT,            -- e.g. 'gigacode' | 'flat-json'
-            created_at  TEXT DEFAULT CURRENT_TIMESTAMP
+            ref_key      TEXT NOT NULL PRIMARY KEY,
+            kind         TEXT NOT NULL,   -- 'class' | 'method'
+            content      TEXT NOT NULL,
+            source       TEXT,            -- e.g. 'gigacode' | 'flat-json'
+            content_hash TEXT,            -- structure_hash of the class at import time
+            created_at   TEXT DEFAULT CURRENT_TIMESTAMP
         )
         """
     )
+    # migration for caches created before content_hash existed
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(imported_description)")}
+    if "content_hash" not in cols:
+        conn.execute("ALTER TABLE imported_description ADD COLUMN content_hash TEXT")
     conn.commit()
     return conn
 
@@ -92,39 +99,47 @@ def set_imported(
     class_text: str | None,
     methods: dict[str, str] | None = None,
     source: str = "flat-json",
+    content_hash: str | None = None,
     commit: bool = True,
 ) -> None:
     """Persist imported class/method descriptions. ``methods`` maps a method's
-    canonical ``signature`` (the index column) to its description text."""
+    canonical ``signature`` (the index column) to its description text.
+    ``content_hash`` is the class's :func:`structure_hash` at import time; later
+    ``describe`` runs ignore these rows once the hash stops matching."""
     if class_text:
         cache.execute(
-            "INSERT INTO imported_description (ref_key, kind, content, source) VALUES (?, 'class', ?, ?) "
+            "INSERT INTO imported_description (ref_key, kind, content, source, content_hash) "
+            "VALUES (?, 'class', ?, ?, ?) "
             "ON CONFLICT(ref_key) DO UPDATE SET content=excluded.content, source=excluded.source, "
-            "created_at=CURRENT_TIMESTAMP",
-            (fqn, class_text, source),
+            "content_hash=excluded.content_hash, created_at=CURRENT_TIMESTAMP",
+            (fqn, class_text, source, content_hash),
         )
     for signature, text in (methods or {}).items():
         if not text:
             continue
         cache.execute(
-            "INSERT INTO imported_description (ref_key, kind, content, source) VALUES (?, 'method', ?, ?) "
+            "INSERT INTO imported_description (ref_key, kind, content, source, content_hash) "
+            "VALUES (?, 'method', ?, ?, ?) "
             "ON CONFLICT(ref_key) DO UPDATE SET content=excluded.content, source=excluded.source, "
-            "created_at=CURRENT_TIMESTAMP",
-            (f"{fqn}#{signature}", text, source),
+            "content_hash=excluded.content_hash, created_at=CURRENT_TIMESTAMP",
+            (f"{fqn}#{signature}", text, source, content_hash),
         )
     if commit:
         cache.commit()
 
 
-def imported_for_class(cache: sqlite3.Connection, fqn: str) -> tuple[str | None, dict[str, str]]:
-    """Return (class_description_or_None, {canonical_signature: method_description})
-    for any imported descriptions of this class."""
+def imported_for_class(
+    cache: sqlite3.Connection, fqn: str
+) -> tuple[str | None, dict[str, str], str | None]:
+    """Return (class_description_or_None, {canonical_signature: method_description},
+    stored_content_hash_or_None) for any imported descriptions of this class."""
     class_text: str | None = None
     methods: dict[str, str] = {}
+    stored_hash: str | None = None
     prefix = f"{fqn}#"
     plen = len(prefix)
     for r in cache.execute(
-        "SELECT ref_key, kind, content FROM imported_description "
+        "SELECT ref_key, kind, content, content_hash FROM imported_description "
         "WHERE ref_key = ? OR substr(ref_key, 1, ?) = ?",
         (fqn, plen, prefix),
     ):
@@ -132,7 +147,9 @@ def imported_for_class(cache: sqlite3.Connection, fqn: str) -> tuple[str | None,
             class_text = r["content"]
         elif r["kind"] == "method" and r["ref_key"].startswith(prefix):
             methods[r["ref_key"][plen:]] = r["content"]
-    return class_text, methods
+        if stored_hash is None and r["content_hash"]:
+            stored_hash = r["content_hash"]
+    return class_text, methods, stored_hash
 
 
 def _cache_get(cache: sqlite3.Connection, ref_key: str, content_hash: str) -> dict | None:
@@ -272,12 +289,11 @@ def _source_snippet(skeleton: dict, repo_root: Path) -> str:
     return text[:_SNIPPET_MAX_CHARS]
 
 
-def _class_hash(skeleton: dict, snippet: str, model: str, lang: str) -> str:
-    """Hash a *stable* projection: names/signatures/annotations + the source snippet.
-    Volatile fields (db ids, line numbers, absolute file path) are excluded so a
-    mere line shift does not invalidate a cached description; real body changes do
-    (they change ``snippet``)."""
-    stable = {
+def _stable_projection(skeleton: dict) -> dict:
+    """Names/signatures/annotations only. Volatile fields (db ids, line numbers,
+    file path) are excluded so a mere line shift does not invalidate anything;
+    real structure/body changes do (they change the projection or ``snippet``)."""
+    return {
         "fqn": skeleton["fqn"],
         "kind": skeleton["kind"],
         "role": skeleton["role"],
@@ -291,8 +307,24 @@ def _class_hash(skeleton: dict, snippet: str, model: str, lang: str) -> str:
         ],
         "endpoints": skeleton["endpoints"],
     }
+
+
+def structure_hash(skeleton: dict, snippet: str) -> str:
+    """Model/lang-independent hash of the class structure + source snippet. Stored
+    alongside *imported* descriptions so they stop winning once the class changes."""
     payload = json.dumps(
-        {"skeleton": stable, "snippet": snippet, "model": model, "lang": lang, "v": PROMPT_VERSION},
+        {"skeleton": _stable_projection(skeleton), "snippet": snippet},
+        ensure_ascii=False, sort_keys=True, default=str,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _class_hash(skeleton: dict, snippet: str, model: str, lang: str) -> str:
+    """Cache key for LLM-generated descriptions: the stable projection + snippet,
+    plus model/lang/prompt-version (a different model or language must regenerate)."""
+    payload = json.dumps(
+        {"skeleton": _stable_projection(skeleton), "snippet": snippet,
+         "model": model, "lang": lang, "v": PROMPT_VERSION},
         ensure_ascii=False, sort_keys=True, default=str,
     )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
@@ -423,8 +455,14 @@ def _describe_class(
     ref_key = skeleton["fqn"]
 
     # Imported descriptions (e.g. a gigacode architecture-generator flat JSON) win
-    # over LLM/fallback and survive re-scans.
-    imp_class, imp_methods = imported_for_class(cache, ref_key)
+    # over LLM/fallback and survive re-scans — but only while the class hasn't
+    # structurally changed since the import (stale imports would confidently
+    # describe old behaviour, which is worse than a bland fallback).
+    imp_class, imp_methods, imp_hash = imported_for_class(cache, ref_key)
+    imports_fresh = imp_hash is None or imp_hash == structure_hash(skeleton, snippet)
+    if not imports_fresh and (imp_class is not None or imp_methods):
+        stats["stale_imported"] += 1
+        imp_class, imp_methods = None, {}
     if imp_class is not None:
         result = {"class": imp_class, "methods": dict(imp_methods)}
         stats["from_imported"] += 1
@@ -561,6 +599,7 @@ def describe_repo(
     stats = {
         "classes": 0, "methods": 0, "packages": 0, "modules": 0, "project": 0,
         "from_cache": 0, "from_llm": 0, "from_fallback": 0, "from_imported": 0,
+        "stale_imported": 0,
         "llm_enabled": llm.enabled, "model": llm.describe(),
     }
     try:
@@ -586,6 +625,8 @@ def describe_repo(
         f"Described {stats['classes']} class(es), {stats['methods']} method(s); "
         f"hierarchy: {stats['packages']} package(s), {stats['modules']} module(s). "
         f"Sources: imported={stats['from_imported']}, llm={stats['from_llm']}, "
-        f"cache={stats['from_cache']}, fallback={stats['from_fallback']}."
+        f"cache={stats['from_cache']}, fallback={stats['from_fallback']}"
+        + (f"; stale imports ignored: {stats['stale_imported']}" if stats["stale_imported"] else "")
+        + "."
     )
     return stats
