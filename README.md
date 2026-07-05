@@ -130,9 +130,18 @@ deterministic descriptions instead, so it always works:
 | `LEGACY_REVERSE_LLM_TIMEOUT` / `_MAX_TOKENS` / `_TEMPERATURE` | `60` / `512` / `0.1` | request tuning |
 
 Descriptions are cached by content hash in `<repo>/.reverse/descriptions.sqlite3`,
-which survives `scan --force`, so re-runs only re-describe changed code. Pass
-`--force` to ignore the cache. You can also trigger it over MCP with
-`generate_descriptions`.
+a file separate from the main index, which survives `scan --force`. Pass `--force`
+to `describe` (not `scan`) to ignore the cache.
+
+**`scan --force` deletes and rebuilds `index.sqlite3` from scratch** — this wipes
+any `describe` output already applied there (`class.summary`/`method.summary` and
+the module/project rows of the `summary` table; `scan` only ever regenerates the
+plain deterministic package-level summary on its own). The description *cache*
+survives, so **re-running `describe` after every `scan --force`** re-applies the
+same descriptions from cache almost instantly (no LLM re-spend for unchanged
+classes) — but skipping that re-run silently leaves you with only the bare
+deterministic fallback text and no module/project summaries at all. You can also
+trigger `describe` over MCP with `generate_descriptions`.
 
 ### 2c. Flat architecture JSON — export / import / gigacode
 

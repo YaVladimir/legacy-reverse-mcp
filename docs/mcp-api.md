@@ -138,7 +138,13 @@ OpenAI-compatible LLM via `LEGACY_REVERSE_LLM_*` env vars; with no endpoint (or
 cache. `{ status: "described", classes, methods, packages, modules, project,
 from_llm, from_cache, from_fallback, llm_enabled, model, search_rows, confidence,
 limitations, warnings }`. Run once after `scan_repository` (can be slow on large
-repos).
+repos) — **and again after every subsequent `scan_repository(force=true)`**:
+`scan` rebuilds `index.sqlite3` from scratch, which wipes any previously-applied
+`class.summary`/`method.summary` and the module/project rows of the `summary`
+table (only the description *cache* file survives, not what's applied in the live
+index). A re-run after a forced rescan is cheap — cache hits mean no LLM re-spend
+for classes that didn't change — but skipping it silently leaves you with only
+the bare deterministic per-class text and no module/project summaries at all.
 
 ### `find_feature(topic, limit=20, methods_per_class=12)`
 Topic/feature → the classes that implement it, each as a compact card **with its
