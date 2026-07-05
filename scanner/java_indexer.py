@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import os
+from collections import deque
 from dataclasses import dataclass, field as dc_field
 from pathlib import Path
 
@@ -14,7 +15,7 @@ from index.queries import _simple_type
 from scanner.endpoint_scanner import class_base_path, extract_endpoints, join_paths
 from scanner.fact_emitter import FactConfig, class_observed_facts, file_import_facts
 from scanner.java_parser import ParsedClass, parse_file
-from scanner.repo_scanner import IGNORED_DIRS
+from scanner.repo_scanner import prune_dirnames
 from scanner.spring_scanner import (
     class_uses_constructor_di,
     classify_role,
@@ -63,7 +64,7 @@ def _resolve_module(rel_path: str, lookup: list[tuple[int, str]]) -> int | None:
 
 def _iter_java_files(repo_root: Path, skip_tests: bool):
     for dirpath, dirnames, filenames in os.walk(repo_root):
-        dirnames[:] = [d for d in dirnames if d not in IGNORED_DIRS]
+        prune_dirnames(Path(dirpath), dirnames)
         if skip_tests:
             parts = Path(dirpath).parts
             # skip standard test source roots: .../src/test/...
@@ -359,3 +360,140 @@ def index_class_dependencies(conn) -> int:
 
     conn.commit()
     return edges
+
+
+_CONTROLLER_ANNOTATIONS = ("@RestController", "@Controller")
+
+
+def reattribute_interface_endpoints(conn) -> int:
+    """Post-pass: resolve REST endpoints whose HTTP mapping annotation lives on an
+    ancestor interface method rather than directly on the @RestController/@Controller
+    class (openapi-generator / Feign-style codegen: ``ControllerImpl implements
+    FeignClient extends BaseApi``, sometimes several hops deep, sometimes with several
+    concrete controllers behind the same shared interface).
+
+    Walks each controller *method's own* implemented-interface chain (breadth-first,
+    arbitrary depth) looking for a same-name/same-arity ancestor method that carries a
+    mapping annotation, and creates the endpoint attributed to the concrete controller
+    + its own method, using the controller's *own* class-level base path (not the
+    interface's -- a controller can add its own @RequestMapping prefix). Each concrete
+    controller is resolved independently by walking *up* from itself, so N sibling
+    implementations of a shared interface each get their own correctly-attributed
+    endpoint -- no arbitrary pick, no merging needed. The original interface-level
+    endpoint row is dropped once some controller claims it; if none do, it's left
+    as-is (the ``interface_impl_unresolved`` limitation stays honest for those)."""
+    controller_annotated: set[int] = {
+        r["class_id"] for r in conn.execute(
+            "SELECT DISTINCT class_id FROM class_annotation WHERE name IN (?, ?)",
+            _CONTROLLER_ANNOTATIONS,
+        )
+    }
+    if not controller_annotated:
+        return 0
+
+    # class_interface.interface_fqn is written as-seen in source (often an
+    # unqualified simple name, e.g. "DealsApi") -- resolve FQN-first, falling back
+    # to simple-name like index_class_dependencies does.
+    name_to_ids: dict[str, list[int]] = {}
+    fqn_to_id: dict[str, int] = {}
+    for r in conn.execute("SELECT id, simple_name, fqn FROM class"):
+        name_to_ids.setdefault(r["simple_name"], []).append(r["id"])
+        fqn_to_id[r["fqn"]] = r["id"]
+
+    def resolve_ref(ref: str) -> list[int]:
+        if ref in fqn_to_id:
+            return [fqn_to_id[ref]]
+        return name_to_ids.get(_simple_type(ref) or ref, [])
+
+    parents: dict[int, list[int]] = {}
+    for r in conn.execute("SELECT class_id, interface_fqn FROM class_interface"):
+        parents.setdefault(r["class_id"], []).extend(resolve_ref(r["interface_fqn"]))
+
+    methods_by_class: dict[int, list[dict]] = {}
+    for r in conn.execute("SELECT id, class_id, name, return_type FROM method"):
+        methods_by_class.setdefault(r["class_id"], []).append(dict(r))
+
+    param_counts: dict[int, int] = {
+        r["method_id"]: r["n"]
+        for r in conn.execute("SELECT method_id, COUNT(*) n FROM method_parameter GROUP BY method_id")
+    }
+
+    def method_annotations(method_id: int) -> list[tuple[str, str | None]]:
+        return [
+            (r["name"], r["attributes"]) for r in conn.execute(
+                "SELECT name, attributes FROM method_annotation WHERE method_id = ?", (method_id,)
+            )
+        ]
+
+    def find_ancestor_endpoint(class_id: int, name: str, arity: int):
+        """BFS the implements/extends chain for a same-name/arity method that
+        carries its own mapping annotation."""
+        seen: set[int] = set()
+        queue = deque(parents.get(class_id, []))
+        while queue:
+            cid = queue.popleft()
+            if cid in seen:
+                continue
+            seen.add(cid)
+            for m in methods_by_class.get(cid, []):
+                if m["name"] != name or param_counts.get(m["id"], 0) != arity:
+                    continue
+                eps = extract_endpoints(method_annotations(m["id"]))
+                if eps:
+                    return m, eps
+            queue.extend(parents.get(cid, []))
+        return None, []
+
+    claimed_endpoint_ids: set[int] = set()
+    created = 0
+
+    for class_id in controller_annotated:
+        class_anns = [
+            (r["name"], r["attributes"]) for r in conn.execute(
+                "SELECT name, attributes FROM class_annotation WHERE class_id = ?", (class_id,)
+            )
+        ]
+        base_path = class_base_path(class_anns)
+
+        for m in methods_by_class.get(class_id, []):
+            if extract_endpoints(method_annotations(m["id"])):
+                continue  # already has its own mapping annotation, indexed correctly already
+
+            arity = param_counts.get(m["id"], 0)
+            src_method, eps = find_ancestor_endpoint(class_id, m["name"], arity)
+            if not eps:
+                continue
+
+            for ep in eps:
+                full_path = join_paths(base_path, ep.sub_path)
+                exists = conn.execute(
+                    "SELECT 1 FROM endpoint WHERE controller_class_id = ? AND handler_method_id = ? "
+                    "AND http_method = ? AND full_path = ?",
+                    (class_id, m["id"], ep.http_method, full_path),
+                ).fetchone()
+                if exists:
+                    continue
+                repo.insert_endpoint(
+                    conn,
+                    http_method=ep.http_method,
+                    path=ep.sub_path or "",
+                    full_path=full_path,
+                    controller_class_id=class_id,
+                    handler_method_id=m["id"],
+                    produces=ep.produces,
+                    consumes=ep.consumes,
+                    response_dto_fqn=m["return_type"],
+                    commit=False,
+                )
+                created += 1
+
+            for row in conn.execute(
+                "SELECT id FROM endpoint WHERE handler_method_id = ?", (src_method["id"],)
+            ):
+                claimed_endpoint_ids.add(row["id"])
+
+    for eid in claimed_endpoint_ids:
+        conn.execute("DELETE FROM endpoint WHERE id = ?", (eid,))
+
+    conn.commit()
+    return created

@@ -12,7 +12,7 @@ from index.findings import detect_findings
 from index.search import build_search_index
 from scanner.config_scanner import index_config
 from scanner.dependency_scanner import index_dependencies
-from scanner.java_indexer import index_class_dependencies, index_repo
+from scanner.java_indexer import index_class_dependencies, index_repo, reattribute_interface_endpoints
 from scanner.repo_scanner import scan_repo
 from summarizer.class_summary import generate_class_summaries
 from summarizer.package_summary import generate_package_summaries
@@ -51,6 +51,10 @@ def build_index(conn, repo_path: str, progress=None, progress_every: int = 0) ->
     echo("Linking class dependencies ...")
     class_edges = index_class_dependencies(conn)
     echo(f"Linked {class_edges} class-to-class edge(s).")
+
+    reattributed_endpoints = reattribute_interface_endpoints(conn)
+    if reattributed_endpoints:
+        echo(f"Reattributed {reattributed_endpoints} endpoint(s) from interface to implementing controller.")
 
     echo("Scanning dependencies ...")
     dep_stats = index_dependencies(conn, repo_path)
@@ -109,6 +113,7 @@ def build_index(conn, repo_path: str, progress=None, progress_every: int = 0) ->
         "observed_facts": stats.observed_facts,
         "method_calls": stats.method_calls,
         "class_edges": class_edges,
+        "reattributed_endpoints": reattributed_endpoints,
         "module_edges": dep_stats.module_edges,
         "external_deps": dep_stats.external_deps,
         "config_files": config_stats.config_files,

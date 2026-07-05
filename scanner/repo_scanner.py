@@ -7,7 +7,34 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 BUILD_FILES = ("pom.xml", "build.gradle", "build.gradle.kts")
-IGNORED_DIRS = {".git", "target", "build", "out", "node_modules", ".idea", ".reverse"}
+IGNORED_DIRS = {".git", "target", "out", "node_modules", ".idea", ".reverse"}
+# "build" is a build-tool output directory (classes, tmp, reports, libs, ...) and is
+# ignored like the others, EXCEPT for build/generated: codegen plugins (e.g. the
+# openapi-generator gradle plugin) write real, annotated Java sources there that don't
+# exist anywhere else in the repo until the project is built.
+_BUILD_DIR = "build"
+_BUILD_ALLOWED_CHILD = "generated"
+
+
+def _is_ignored_path(path: Path) -> bool:
+    parts = path.parts
+    for i, part in enumerate(parts):
+        if part in IGNORED_DIRS:
+            return True
+        if part == _BUILD_DIR:
+            nxt = parts[i + 1] if i + 1 < len(parts) else None
+            if nxt != _BUILD_ALLOWED_CHILD:
+                return True
+    return False
+
+
+def prune_dirnames(dirpath: Path, dirnames: list[str]) -> None:
+    """In-place ``os.walk`` dirnames filter: drop ignored dirs, and inside a ``build``
+    dir keep only ``generated`` (so codegen output is visible, other build output isn't)."""
+    if dirpath.name == _BUILD_DIR:
+        dirnames[:] = [d for d in dirnames if d == _BUILD_ALLOWED_CHILD]
+    else:
+        dirnames[:] = [d for d in dirnames if d not in IGNORED_DIRS]
 
 POM_NS = {"m": "http://maven.apache.org/POM/4.0.0"}
 
@@ -78,7 +105,7 @@ def _parse_gradle_name(build_file: Path) -> dict:
 def _count_java_files(module_dir: Path) -> int:
     count = 0
     for path in module_dir.rglob("*.java"):
-        if any(part in IGNORED_DIRS for part in path.parts):
+        if _is_ignored_path(path):
             continue
         count += 1
     return count
@@ -94,6 +121,10 @@ def scan_repo(repo_path: str) -> ScanResult:
     total_files = 0
 
     for dirpath in [root, *_walk_dirs(root)]:
+        if dirpath != root and _BUILD_DIR in dirpath.relative_to(root).parts:
+            # codegen scaffolding under build/generated/** (e.g. openapi-generator writing
+            # a throwaway pom.xml per spec) is a source of Java files, not a real module.
+            continue
         build_file = next((dirpath / bf for bf in BUILD_FILES if (dirpath / bf).is_file()), None)
         if build_file is None:
             continue
@@ -120,7 +151,7 @@ def scan_repo(repo_path: str) -> ScanResult:
         modules.append(module)
 
     for path in root.rglob("*"):
-        if path.is_file() and not any(part in IGNORED_DIRS for part in path.parts):
+        if path.is_file() and not _is_ignored_path(path):
             total_files += 1
 
     if modules:
@@ -134,8 +165,8 @@ def scan_repo(repo_path: str) -> ScanResult:
 
 def _walk_dirs(root: Path):
     for dirpath, dirnames, _ in __import__("os").walk(root):
-        dirnames[:] = [d for d in dirnames if d not in IGNORED_DIRS]
         p = Path(dirpath)
+        prune_dirnames(p, dirnames)
         if p == root:
             continue
         yield p
