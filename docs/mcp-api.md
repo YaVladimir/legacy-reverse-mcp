@@ -179,10 +179,13 @@ Load descriptions from a flat architecture JSON (e.g. produced by the GigaCode s
 the index. Classes match by `pkg.name` (fallback: simple name); methods by name (+ parameter
 type simple-names for overloads; parameter names and return type are ignored). Imported
 descriptions are written to `class.summary`/`method.summary` **and** a durable imported store,
-so they **win over LLM/fallback** in a later `describe` and survive re-scans. `{status:
-"imported", classes_total, classes_matched, methods_matched, methods_unmatched,
-unmatched_classes: [...], search_rows, confidence: "medium", limitations, warnings}`.
-Missing / non-JSON file → structured error.
+so they **win over LLM/fallback** in a later `describe` and survive re-scans — but only while
+the class is structurally unchanged: the import records a structure hash (signatures/
+annotations + source snippet), and once it stops matching, `describe` ignores the import as
+stale (`stale_imported` in its stats) rather than serving text that confidently describes old
+behaviour. `{status: "imported", classes_total, classes_matched, methods_matched,
+methods_unmatched, unmatched_classes: [...], search_rows, confidence: "medium", limitations,
+warnings}`. Missing / non-JSON file → structured error.
 
 ### `generate_architecture()`
 Run gigacode-cli's `architecture-generator` skill and import its flat JSON in one step,
