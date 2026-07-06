@@ -130,9 +130,21 @@ deterministic descriptions instead, so it always works:
 | `LEGACY_REVERSE_LLM_TIMEOUT` / `_MAX_TOKENS` / `_TEMPERATURE` | `60` / `512` / `0.1` | request tuning |
 
 Descriptions are cached by content hash in `<repo>/.reverse/descriptions.sqlite3`,
-which survives `scan --force`, so re-runs only re-describe changed code. Pass
-`--force` to ignore the cache. You can also trigger it over MCP with
-`generate_descriptions`.
+a file separate from the main index, which survives `scan --force`. Pass `--force`
+to `describe` (not `scan`) to ignore the cache.
+
+**`scan --force` deletes and rebuilds `index.sqlite3` from scratch** — this wipes
+any `describe` output already applied there (`class.summary`/`method.summary` and
+the module/project rows of the `summary` table; `scan` only ever regenerates the
+plain deterministic package-level summary on its own). **Imported** descriptions
+(`import-arch`, `generate-arch`, batch generation) are restored automatically: at
+the end of every scan the pipeline re-applies still-fresh entries from the durable
+store (`descriptions.sqlite3`, which survives `scan --force`), skipping classes
+whose structure hash no longer matches the code. What is *not* auto-restored:
+descriptions produced by `describe`'s own LLM pass and the module/project summary
+rows — **re-run `describe` after `scan --force`** to get those back (cheap:
+content-hash cache hits mean no LLM re-spend for unchanged classes). You can also
+trigger `describe` over MCP with `generate_descriptions`.
 
 ### 2c. Flat architecture JSON — export / import / gigacode
 
@@ -149,8 +161,12 @@ legacy-reverse export-arch --repo /path/to/java-project --out arch.json
 legacy-reverse import-arch --repo /path/to/java-project --in arch.json
 ```
 
-Imported descriptions win over LLM/fallback and survive re-scans, so the recommended
-"meaning" source is your GigaCode skill: it produces the JSON, we import it.
+Imported descriptions win over LLM/fallback and survive re-scans **while the class is
+unchanged**: `import-arch` stores a structure hash per class, and once the class's
+signatures/annotations/source change, a later `describe` treats that import as stale and
+falls back to LLM/deterministic text instead of serving an outdated description. So the
+recommended "meaning" source is your GigaCode skill: it produces the JSON, we import it,
+and re-import (or `describe`) after significant code changes.
 
 **gigacode harness.** `generate-arch` runs the GigaCode skill for you and imports the
 result in one step:
@@ -175,6 +191,32 @@ your work machine:
 If gigacode isn't installed/authenticated, `generate-arch` reports a clear error — run the
 skill manually and use `import-arch --in <file>`. Over MCP: `export_architecture`,
 `import_architecture`, `generate_architecture`.
+
+**Batch generation for large repos.** For hundreds of classes, one GigaCode session won't
+fit; `summarizer.batch_generate` chunks the exported `arch.json` and runs several sessions
+in parallel, then validates, merges and imports the results:
+
+```bash
+legacy-reverse scan --repo /path/to/java-project --report
+legacy-reverse export-arch --repo /path/to/java-project --out arch.json
+python -m summarizer.batch_generate arch.json --repo /path/to/java-project --parallel 5
+```
+
+What it does beyond naive chunking:
+
+- each GigaCode session runs with the target repo as cwd, and the prompt instructs the
+  model to **open every class's source file** (the flat `id` is its repo-relative path)
+  and to describe side effects/invariants from real code — never to invent;
+- each chunk response is **validated against what was sent**: classes the model renamed,
+  invented or dropped are rejected instead of being leniently mis-matched on import;
+- results are imported with structure hashes (the staleness contract above), and a final
+  `describe` pass rebuilds the package/module/project summaries from the imported class
+  descriptions (skippable via `--skip-describe`);
+- failed chunks are kept on disk and retried selectively via `--resume <work-dir>`.
+
+Avoid `--no-import` unless you intend to review `arch-merged.json` by hand first: the MCP
+tools read **only** the SQLite index, so un-imported descriptions are invisible to the
+agent until you run `import-arch`.
 
 ### 3. Run the MCP server manually
 

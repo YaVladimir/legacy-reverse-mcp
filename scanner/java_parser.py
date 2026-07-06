@@ -427,7 +427,9 @@ def parse_source(source: bytes, file_path: str) -> ParsedFile:
     return result
 
 
-def parse_file(path: str | Path) -> ParsedFile:
+def parse_file(path: str | Path, *, display_path: str | None = None) -> ParsedFile:
+    """``display_path`` overrides the ``file_path`` recorded on the result (e.g. a
+    repo-relative path), while ``path`` is still used to actually read the file."""
     path = Path(path)
     source = path.read_bytes()
-    return parse_source(source, str(path))
+    return parse_source(source, display_path if display_path is not None else str(path))

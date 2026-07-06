@@ -12,7 +12,7 @@ from index.findings import detect_findings
 from index.search import build_search_index
 from scanner.config_scanner import index_config
 from scanner.dependency_scanner import index_dependencies
-from scanner.java_indexer import index_class_dependencies, index_repo
+from scanner.java_indexer import index_class_dependencies, index_repo, reattribute_interface_endpoints
 from scanner.repo_scanner import scan_repo
 from summarizer.class_summary import generate_class_summaries
 from summarizer.package_summary import generate_package_summaries
@@ -52,6 +52,14 @@ def build_index(conn, repo_path: str, progress=None, progress_every: int = 0) ->
     class_edges = index_class_dependencies(conn)
     echo(f"Linked {class_edges} class-to-class edge(s).")
 
+    reattributed_endpoints = reattribute_interface_endpoints(conn)
+    if reattributed_endpoints:
+        echo(f"Reattributed {reattributed_endpoints} endpoint(s) from interface to implementing controller.")
+    # reattribution can both create (per concrete controller) and delete (claimed
+    # interface-level) endpoint rows, so the parse-time stats.endpoints count is
+    # stale afterwards -- recompute for the manifest and the returned summary.
+    total_endpoints = conn.execute("SELECT COUNT(*) FROM endpoint").fetchone()[0]
+
     echo("Scanning dependencies ...")
     dep_stats = index_dependencies(conn, repo_path)
     echo(
@@ -71,6 +79,22 @@ def build_index(conn, repo_path: str, progress=None, progress_every: int = 0) ->
     class_summaries = generate_class_summaries(conn)
     package_summaries = generate_package_summaries(conn)
     echo(f"Summarized {class_summaries} class(es), {package_summaries} package(s).")
+
+    # a rebuilt index loses previously applied describe/import output; the durable
+    # store (descriptions.sqlite3) survives, so restore what is still fresh before
+    # the FTS build picks summaries up. No LLM. Local import: keeps scanner free of
+    # a summarizer-LLM dependency at module load.
+    from summarizer.describe import reapply_imported
+
+    restored = reapply_imported(conn, repo_path)
+    if restored["classes"] or restored["methods"]:
+        msg = (
+            f"Restored {restored['classes']} imported class / {restored['methods']} "
+            f"method description(s) from the durable store"
+        )
+        if restored["stale"]:
+            msg += f"; {restored['stale']} stale import(s) skipped"
+        echo(msg + ".")
 
     echo("Building search index ...")
     search_rows = build_search_index(conn)
@@ -95,7 +119,7 @@ def build_index(conn, repo_path: str, progress=None, progress_every: int = 0) ->
     conn.execute(
         "INSERT INTO scan_manifest (repo_path, build_tool, total_files, total_classes, total_endpoints) "
         "VALUES (?, ?, ?, ?, ?)",
-        (repo_path, result.build_tool, result.total_files, stats.classes, stats.endpoints),
+        (repo_path, result.build_tool, result.total_files, stats.classes, total_endpoints),
     )
     conn.commit()
 
@@ -105,10 +129,11 @@ def build_index(conn, repo_path: str, progress=None, progress_every: int = 0) ->
         "classes": stats.classes,
         "methods": stats.methods,
         "fields": stats.fields,
-        "endpoints": stats.endpoints,
+        "endpoints": total_endpoints,
         "observed_facts": stats.observed_facts,
         "method_calls": stats.method_calls,
         "class_edges": class_edges,
+        "reattributed_endpoints": reattributed_endpoints,
         "module_edges": dep_stats.module_edges,
         "external_deps": dep_stats.external_deps,
         "config_files": config_stats.config_files,
@@ -120,5 +145,6 @@ def build_index(conn, repo_path: str, progress=None, progress_every: int = 0) ->
         "search_rows": search_rows,
         "findings": findings,
         "inferred_findings": len(inferred),
+        "restored_descriptions": restored,
         "parse_failures": stats.files_failed,
     }

@@ -168,6 +168,13 @@ CREATE TABLE IF NOT EXISTS endpoint (
     full_path       TEXT,               -- с учётом @RequestMapping на классе
     controller_class_id INTEGER REFERENCES class(id) ON DELETE SET NULL,
     handler_method_id   INTEGER REFERENCES method(id) ON DELETE SET NULL,
+    -- where the mapping annotation itself was found. Equal to controller_class_id/
+    -- handler_method_id when the annotation is directly on the controller; differs
+    -- when it's inherited from an ancestor interface (reattribute_interface_endpoints
+    -- moves controller_class_id/handler_method_id to the concrete @RestController for
+    -- DI-trace purposes, but the annotation source line must stay truthful).
+    annotation_class_id  INTEGER REFERENCES class(id) ON DELETE SET NULL,
+    annotation_method_id INTEGER REFERENCES method(id) ON DELETE SET NULL,
     produces        TEXT,               -- application/json
     consumes        TEXT,
     request_dto_fqn  TEXT,
@@ -391,12 +398,22 @@ SELECT
     m.name        AS handler_name,
     m.signature   AS handler_signature,
     m.line_start  AS handler_line,
+    -- annotation source: same as the controller/handler above unless the mapping
+    -- was inherited from an ancestor interface, in which case these point at the
+    -- class/method that actually carries the annotation.
+    COALESCE(ac.fqn, c.fqn)               AS annotation_fqn,
+    COALESCE(ac.file_path, c.file_path)   AS annotation_file,
+    COALESCE(am.name, m.name)             AS annotation_method_name,
+    COALESCE(am.line_start, m.line_start) AS annotation_line,
+    (e.annotation_class_id IS NOT NULL AND e.annotation_class_id != e.controller_class_id) AS annotation_inherited,
     e.request_dto_fqn,
     e.response_dto_fqn,
     e.deprecated
 FROM endpoint e
-LEFT JOIN class  c ON c.id = e.controller_class_id
-LEFT JOIN method m ON m.id = e.handler_method_id;
+LEFT JOIN class  c  ON c.id = e.controller_class_id
+LEFT JOIN method m  ON m.id = e.handler_method_id
+LEFT JOIN class  ac ON ac.id = e.annotation_class_id
+LEFT JOIN method am ON am.id = e.annotation_method_id;
 
 -- Классы с их модулями и пакетами
 CREATE VIEW IF NOT EXISTS v_class_full AS

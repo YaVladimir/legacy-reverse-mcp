@@ -19,7 +19,7 @@ from pathlib import Path
 import yaml
 
 from index import repository as repo
-from scanner.repo_scanner import IGNORED_DIRS
+from scanner.repo_scanner import _is_ignored_path, prune_dirnames
 
 _CONFIG_STEMS = ("application", "bootstrap")
 _YAML_SUFFIXES = (".yml", ".yaml")
@@ -68,10 +68,12 @@ def _is_config_name(name: str) -> bool:
 
 def _walk_config_files(root: Path):
     for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = [d for d in dirnames if d not in IGNORED_DIRS]
+        prune_dirnames(Path(dirpath), dirnames)
         for name in filenames:
             if _is_config_name(name):
-                yield Path(dirpath) / name
+                candidate = Path(dirpath) / name
+                if not _is_ignored_path(candidate):
+                    yield candidate
 
 
 def _kind(name: str) -> str:

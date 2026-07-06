@@ -126,20 +126,36 @@ def trace_endpoint(
     handler_name = full["handler_name"]
     file_path = full["controller_file"]
 
+    endpoint_evidence = [
+        ev(
+            "mapping_annotation",
+            f"{ep['http_method']} {ep['full_path']} handled by {controller_name}#{handler_name}",
+            file_path=file_path,
+            line_start=full["handler_line"],
+            symbol=f"{controller_name}#{handler_name}",
+        )
+    ]
+    if full["annotation_inherited"]:
+        # controller/handler above is the concrete @RestController the DI-trace starts
+        # from, but the mapping annotation itself lives on an ancestor interface —
+        # cite that truthfully instead of implying it's on the controller line.
+        annotation_symbol = f"{_simple_type(full['annotation_fqn']) or full['annotation_fqn']}#{full['annotation_method_name']}"
+        endpoint_evidence.append(
+            ev(
+                "inherited_mapping_annotation",
+                f"Annotation inherited from {annotation_symbol}, implemented by {controller_name}#{handler_name}",
+                file_path=full["annotation_file"],
+                line_start=full["annotation_line"],
+                symbol=annotation_symbol,
+            )
+        )
+
     endpoint_block = {
         "http_method": ep["http_method"],
         "path": ep["full_path"],
         "controller_class": controller_name,
         "controller_method": handler_name,
-        "evidence": [
-            ev(
-                "mapping_annotation",
-                f"{ep['http_method']} {ep['full_path']} handled by {controller_name}#{handler_name}",
-                file_path=file_path,
-                line_start=full["handler_line"],
-                symbol=f"{controller_name}#{handler_name}",
-            )
-        ],
+        "evidence": endpoint_evidence,
     }
 
     steps: list[dict] = [

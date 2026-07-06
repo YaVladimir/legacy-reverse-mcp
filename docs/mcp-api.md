@@ -11,6 +11,9 @@ All tools return JSON. **Heuristic** tools always include `confidence`,
 - `confidence`: `"high" | "medium" | "low" | "unknown"` — see
   [confidence-model.md](confidence-model.md).
 - `evidence`: list of `{kind, description, file_path?, line_start?, line_end?, symbol?, source}`.
+- `file_path` (wherever it appears — evidence, class/method rows, config files, ...) is always
+  **repo-relative** (forward slashes), never absolute. Join it against the `--repo`/
+  `LEGACY_REVERSE_REPO` path if you need to open the file.
 - `limitations`: list of `{code, description}` — see [limitations.md](limitations.md).
 - Errors: `{ "error": "not_found", "kind": "...", "query": ..., "message": "...", "suggestions": [...] }`.
 
@@ -138,7 +141,16 @@ OpenAI-compatible LLM via `LEGACY_REVERSE_LLM_*` env vars; with no endpoint (or
 cache. `{ status: "described", classes, methods, packages, modules, project,
 from_llm, from_cache, from_fallback, llm_enabled, model, search_rows, confidence,
 limitations, warnings }`. Run once after `scan_repository` (can be slow on large
-repos).
+repos) — **and again after every subsequent `scan_repository(force=true)`**:
+`scan` rebuilds `index.sqlite3` from scratch, which wipes any previously-applied
+`class.summary`/`method.summary` and the module/project rows of the `summary`
+table. **Imported** descriptions (`import_architecture`, gigacode/batch) are the
+exception — the scan pipeline auto-restores still-fresh ones from the surviving
+`descriptions.sqlite3` (stale imports, where the class changed, are skipped). A
+`describe` re-run after a forced rescan is cheap — cache hits mean no LLM
+re-spend for classes that didn't change — but skipping it leaves classes not
+covered by imports with only the bare deterministic text and no module/project
+summaries.
 
 ### `find_feature(topic, limit=20, methods_per_class=12)`
 Topic/feature → the classes that implement it, each as a compact card **with its
@@ -173,10 +185,14 @@ Load descriptions from a flat architecture JSON (e.g. produced by the GigaCode s
 the index. Classes match by `pkg.name` (fallback: simple name); methods by name (+ parameter
 type simple-names for overloads; parameter names and return type are ignored). Imported
 descriptions are written to `class.summary`/`method.summary` **and** a durable imported store,
-so they **win over LLM/fallback** in a later `describe` and survive re-scans. `{status:
-"imported", classes_total, classes_matched, methods_matched, methods_unmatched,
-unmatched_classes: [...], search_rows, confidence: "medium", limitations, warnings}`.
-Missing / non-JSON file → structured error.
+so they **win over LLM/fallback** in a later `describe` and survive re-scans (the scan pipeline
+re-applies them to the rebuilt index automatically, no manual re-import needed) — but only
+while the class is structurally unchanged: the import records a structure hash (signatures/
+annotations + source snippet), and once it stops matching, both the scan-time restore and
+`describe` ignore the import as stale (`stale_imported` in describe's stats) rather than
+serving text that confidently describes old behaviour. `{status: "imported", classes_total, classes_matched, methods_matched,
+methods_unmatched, unmatched_classes: [...], search_rows, confidence: "medium", limitations,
+warnings}`. Missing / non-JSON file → structured error.
 
 ### `generate_architecture()`
 Run gigacode-cli's `architecture-generator` skill and import its flat JSON in one step,

@@ -47,8 +47,9 @@ _GENERIC = re.compile(r"<[^<>]*>")
 def _flat_id(file_path: str | None, fqn: str, repo_root: Path) -> str:
     if not file_path:
         return fqn
+    p = Path(file_path)
     try:
-        rel = Path(file_path).resolve().relative_to(repo_root).as_posix()
+        rel = p.as_posix() if not p.is_absolute() else p.resolve().relative_to(repo_root).as_posix()
     except (ValueError, OSError):
         return fqn
     return rel[:-5] if rel.endswith(".java") else rel
@@ -172,6 +173,7 @@ def import_flat(
     if not classes:
         return stats
 
+    repo_root = Path(repo_path).resolve()
     cache = describe._open_cache(repo_path)
     try:
         for entry in classes:
@@ -207,10 +209,16 @@ def import_flat(
 
             if class_desc:
                 repo.set_class_summary(conn, class_id, class_desc, commit=False)
-            describe.set_imported(
-                cache, class_fqn, class_text=class_desc or None, methods=method_map,
-                source=source, commit=False,
-            )
+            if class_desc or method_map:
+                # structure hash at import time: a later `describe` ignores these rows
+                # once the class structurally changes, instead of serving stale text
+                skeleton = describe._class_skeleton(conn, class_id)
+                snippet = describe._source_snippet(skeleton, repo_root)
+                describe.set_imported(
+                    cache, class_fqn, class_text=class_desc or None, methods=method_map,
+                    source=source, content_hash=describe.structure_hash(skeleton, snippet),
+                    commit=False,
+                )
             stats["classes_matched"] += 1
 
         conn.commit()

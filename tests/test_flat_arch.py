@@ -107,6 +107,54 @@ def test_import_then_describe_keeps_imported(tmp_path, monkeypatch):
     conn.close()
 
 
+def test_import_goes_stale_when_class_changes(tmp_path, monkeypatch):
+    """An imported description must stop winning once the class structurally
+    changes — a stale import confidently describing old behaviour is worse
+    than the bland fallback."""
+    repo, db, conn = _scan_describe(tmp_path, monkeypatch)
+    custom = {
+        "classes": [
+            {
+                "pkg": "ru.bank.deposit", "name": "DepositController",
+                "kind": "class", "type": "controller",
+                "description": "КАСТОМ: фасад API депозитов.",
+                "class_modifiers": ["public"], "extends": None, "implements": None,
+                "fields": [], "methods": [],
+            }
+        ]
+    }
+    assert flat_arch.import_flat(conn, str(repo), custom)["classes_matched"] == 1
+    conn.commit()
+
+    # unchanged class: the import must still win
+    describe_repo(conn, str(repo), use_llm=False)
+    conn.commit()
+    row = conn.execute("SELECT summary FROM class WHERE simple_name = 'DepositController'").fetchone()
+    assert row["summary"] == "КАСТОМ: фасад API депозитов."
+    conn.close()
+
+    # change the class structure (new method) and rebuild the index (scan --force)
+    src = repo / "src/main/java/ru/bank/deposit/DepositController.java"
+    text = src.read_text(encoding="utf-8")
+    src.write_text(
+        text.replace(
+            "public class DepositController {",
+            "public class DepositController {\n    public void closeDeposit(String id) { }\n",
+        ),
+        encoding="utf-8",
+    )
+    db.unlink()
+    conn = init_db(db)
+    build_index(conn, str(repo))
+
+    stats = describe_repo(conn, str(repo), use_llm=False)
+    conn.commit()
+    assert stats["stale_imported"] >= 1
+    row = conn.execute("SELECT summary FROM class WHERE simple_name = 'DepositController'").fetchone()
+    assert row["summary"] != "КАСТОМ: фасад API депозитов."  # fallback, not the stale import
+    conn.close()
+
+
 def test_import_reports_unmatched(tmp_path, monkeypatch):
     repo, _db, conn = _scan_describe(tmp_path, monkeypatch)
     data = {"classes": [{"pkg": "ru.bank.deposit", "name": "GhostClass", "description": "x"}]}
