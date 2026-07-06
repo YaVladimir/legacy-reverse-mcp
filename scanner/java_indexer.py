@@ -385,8 +385,17 @@ def reattribute_interface_endpoints(conn) -> int:
     controller is resolved independently by walking *up* from itself, so N sibling
     implementations of a shared interface each get their own correctly-attributed
     endpoint -- no arbitrary pick, no merging needed. The original interface-level
-    endpoint row is dropped once some controller claims it; if none do, it's left
-    as-is (the ``interface_impl_unresolved`` limitation stays honest for those)."""
+    endpoint row is dropped only when every controller behind the interface produced
+    its own replacement; if some sibling didn't, it's kept (the
+    ``interface_impl_unresolved`` limitation stays honest for those).
+
+    Known limitation: only methods *overridden in the concrete controller* are
+    reattributed. In the delegate pattern (``ApiController implements ApiApi`` where
+    the controller inherits ``default`` methods without overriding them) the endpoint
+    stays attributed to the interface -- honest, but the concrete controller is not
+    linked. Detecting inherited-but-not-overridden handlers would require attributing
+    an endpoint to a class that has no matching method row, which the schema's
+    handler_method_id semantics don't support today."""
     controller_annotated: set[int] = {
         r["class_id"] for r in conn.execute(
             "SELECT DISTINCT class_id FROM class_annotation WHERE name IN (?, ?)",
@@ -459,7 +468,23 @@ def reattribute_interface_endpoints(conn) -> int:
             queue.extend(parents.get(cid, []))
         return None, []
 
-    claimed_endpoint_ids: set[int] = set()
+    def ancestor_closure(class_id: int) -> set[int]:
+        out: set[int] = set()
+        queue = deque(parents.get(class_id, []))
+        while queue:
+            cid = queue.popleft()
+            if cid in out:
+                continue
+            out.add(cid)
+            queue.extend(parents.get(cid, []))
+        return out
+
+    controller_ancestors = {cid: ancestor_closure(cid) for cid in controller_annotated}
+
+    # src_method_id -> controllers that produced a replacement for it, and the
+    # class owning that method — used at the end to decide what's safe to delete
+    claims: dict[int, set[int]] = {}
+    src_owner: dict[int, int] = {}
     created = 0
 
     for class_id in controller_annotated:
@@ -506,13 +531,22 @@ def reattribute_interface_endpoints(conn) -> int:
                 )
                 created += 1
 
-            for row in conn.execute(
-                "SELECT id FROM endpoint WHERE handler_method_id = ?", (src_method["id"],)
-            ):
-                claimed_endpoint_ids.add(row["id"])
+            claims.setdefault(src_method["id"], set()).add(class_id)
+            src_owner[src_method["id"]] = src_method["class_id"]
 
-    for eid in claimed_endpoint_ids:
-        conn.execute("DELETE FROM endpoint WHERE id = ?", (eid,))
+    # drop an interface-level endpoint row only when EVERY controller behind that
+    # interface produced its own replacement. If a sibling didn't (it inherits the
+    # default method without overriding it — delegate pattern — or its interface
+    # link failed to resolve), the interface row stays as that sibling's only
+    # honest representation instead of vanishing from the index entirely.
+    for src_id, claimers in claims.items():
+        owner = src_owner[src_id]
+        implementors = {
+            cid for cid, ancestors in controller_ancestors.items() if owner in ancestors
+        }
+        if implementors - claimers:
+            continue
+        conn.execute("DELETE FROM endpoint WHERE handler_method_id = ?", (src_id,))
 
     conn.commit()
     return created
