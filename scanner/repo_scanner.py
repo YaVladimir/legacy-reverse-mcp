@@ -7,13 +7,15 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 BUILD_FILES = ("pom.xml", "build.gradle", "build.gradle.kts")
-IGNORED_DIRS = {".git", "target", "out", "node_modules", ".idea", ".reverse"}
-# "build" is a build-tool output directory (classes, tmp, reports, libs, ...) and is
-# ignored like the others, EXCEPT for build/generated: codegen plugins (e.g. the
-# openapi-generator gradle plugin) write real, annotated Java sources there that don't
-# exist anywhere else in the repo until the project is built.
-_BUILD_DIR = "build"
-_BUILD_ALLOWED_CHILD = "generated"
+IGNORED_DIRS = {".git", "out", "node_modules", ".idea", ".reverse"}
+# Build-tool output dirs (classes, tmp, reports, libs, ...) are ignored like the
+# others, EXCEPT for one specific child each: codegen plugins (e.g. the
+# openapi-generator Gradle/Maven plugin) write real, annotated Java sources there
+# that don't exist anywhere else in the repo until the project is built.
+_CODEGEN_ALLOWED_CHILD = {
+    "build": "generated",           # Gradle
+    "target": "generated-sources",  # Maven
+}
 
 
 def _is_ignored_path(path: Path) -> bool:
@@ -21,18 +23,21 @@ def _is_ignored_path(path: Path) -> bool:
     for i, part in enumerate(parts):
         if part in IGNORED_DIRS:
             return True
-        if part == _BUILD_DIR:
+        allowed_child = _CODEGEN_ALLOWED_CHILD.get(part)
+        if allowed_child is not None:
             nxt = parts[i + 1] if i + 1 < len(parts) else None
-            if nxt != _BUILD_ALLOWED_CHILD:
+            if nxt != allowed_child:
                 return True
     return False
 
 
 def prune_dirnames(dirpath: Path, dirnames: list[str]) -> None:
-    """In-place ``os.walk`` dirnames filter: drop ignored dirs, and inside a ``build``
-    dir keep only ``generated`` (so codegen output is visible, other build output isn't)."""
-    if dirpath.name == _BUILD_DIR:
-        dirnames[:] = [d for d in dirnames if d == _BUILD_ALLOWED_CHILD]
+    """In-place ``os.walk`` dirnames filter: drop ignored dirs, and inside a
+    build-output dir (``build``, ``target``) keep only its codegen child (so
+    generated sources are visible, other build output isn't)."""
+    allowed_child = _CODEGEN_ALLOWED_CHILD.get(dirpath.name)
+    if allowed_child is not None:
+        dirnames[:] = [d for d in dirnames if d == allowed_child]
     else:
         dirnames[:] = [d for d in dirnames if d not in IGNORED_DIRS]
 
@@ -121,9 +126,12 @@ def scan_repo(repo_path: str) -> ScanResult:
     total_files = 0
 
     for dirpath in [root, *_walk_dirs(root)]:
-        if dirpath != root and _BUILD_DIR in dirpath.relative_to(root).parts:
-            # codegen scaffolding under build/generated/** (e.g. openapi-generator writing
-            # a throwaway pom.xml per spec) is a source of Java files, not a real module.
+        if dirpath != root and any(
+            part in _CODEGEN_ALLOWED_CHILD for part in dirpath.relative_to(root).parts
+        ):
+            # codegen scaffolding under build/generated/**, target/generated-sources/**
+            # (e.g. openapi-generator writing a throwaway pom.xml per spec) is a
+            # source of Java files, not a real module.
             continue
         build_file = next((dirpath / bf for bf in BUILD_FILES if (dirpath / bf).is_file()), None)
         if build_file is None:

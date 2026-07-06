@@ -15,7 +15,7 @@ from index.queries import _simple_type
 from scanner.endpoint_scanner import class_base_path, extract_endpoints, join_paths
 from scanner.fact_emitter import FactConfig, class_observed_facts, file_import_facts
 from scanner.java_parser import ParsedClass, parse_file
-from scanner.repo_scanner import prune_dirnames
+from scanner.repo_scanner import _is_ignored_path, prune_dirnames
 from scanner.spring_scanner import (
     class_uses_constructor_di,
     classify_role,
@@ -75,7 +75,12 @@ def _iter_java_files(repo_root: Path, skip_tests: bool):
                     continue
         for name in filenames:
             if name.endswith(".java"):
-                yield Path(dirpath) / name
+                candidate = Path(dirpath) / name
+                # prune_dirnames only prunes subdirectories to recurse into; a stray
+                # .java file directly inside an otherwise-ignored dir (e.g. build/
+                # itself, not build/generated/) would still be yielded without this.
+                if not _is_ignored_path(candidate):
+                    yield candidate
 
 
 def _import_map(imports: list[str]) -> dict[str, str]:
@@ -403,7 +408,14 @@ def reattribute_interface_endpoints(conn) -> int:
     def resolve_ref(ref: str) -> list[int]:
         if ref in fqn_to_id:
             return [fqn_to_id[ref]]
-        return name_to_ids.get(_simple_type(ref) or ref, [])
+        # unlike read-time search (where linking every same-name candidate just
+        # over-approximates results), this is a write path that mutates endpoint
+        # rows -- an ambiguous simple name could walk into an unrelated class and
+        # attribute its annotation as if it were this controller's own mapping.
+        # Be conservative: skip it, leaving the interface-level endpoint row
+        # unclaimed (honest `interface_impl_unresolved`) rather than guessing.
+        candidates = name_to_ids.get(_simple_type(ref) or ref, [])
+        return candidates if len(candidates) == 1 else []
 
     parents: dict[int, list[int]] = {}
     for r in conn.execute("SELECT class_id, interface_fqn FROM class_interface"):
@@ -413,10 +425,11 @@ def reattribute_interface_endpoints(conn) -> int:
     for r in conn.execute("SELECT id, class_id, name, return_type FROM method"):
         methods_by_class.setdefault(r["class_id"], []).append(dict(r))
 
-    param_counts: dict[int, int] = {
-        r["method_id"]: r["n"]
-        for r in conn.execute("SELECT method_id, COUNT(*) n FROM method_parameter GROUP BY method_id")
-    }
+    param_types: dict[int, list[str]] = {}
+    for r in conn.execute(
+        "SELECT method_id, type_fqn FROM method_parameter ORDER BY method_id, position"
+    ):
+        param_types.setdefault(r["method_id"], []).append(_simple_type(r["type_fqn"]) or r["type_fqn"])
 
     def method_annotations(method_id: int) -> list[tuple[str, str | None]]:
         return [
@@ -425,9 +438,11 @@ def reattribute_interface_endpoints(conn) -> int:
             )
         ]
 
-    def find_ancestor_endpoint(class_id: int, name: str, arity: int):
-        """BFS the implements/extends chain for a same-name/arity method that
-        carries its own mapping annotation."""
+    def find_ancestor_endpoint(class_id: int, name: str, params: list[str]):
+        """BFS the implements/extends chain for a same-name/same-parameter-types
+        ancestor method that carries its own mapping annotation. Matching on
+        parameter types (not just arity) avoids attributing the wrong mapping to
+        an overload that merely happens to take the same number of arguments."""
         seen: set[int] = set()
         queue = deque(parents.get(class_id, []))
         while queue:
@@ -436,7 +451,7 @@ def reattribute_interface_endpoints(conn) -> int:
                 continue
             seen.add(cid)
             for m in methods_by_class.get(cid, []):
-                if m["name"] != name or param_counts.get(m["id"], 0) != arity:
+                if m["name"] != name or param_types.get(m["id"], []) != params:
                     continue
                 eps = extract_endpoints(method_annotations(m["id"]))
                 if eps:
@@ -459,8 +474,7 @@ def reattribute_interface_endpoints(conn) -> int:
             if extract_endpoints(method_annotations(m["id"])):
                 continue  # already has its own mapping annotation, indexed correctly already
 
-            arity = param_counts.get(m["id"], 0)
-            src_method, eps = find_ancestor_endpoint(class_id, m["name"], arity)
+            src_method, eps = find_ancestor_endpoint(class_id, m["name"], param_types.get(m["id"], []))
             if not eps:
                 continue
 
@@ -483,6 +497,11 @@ def reattribute_interface_endpoints(conn) -> int:
                     produces=ep.produces,
                     consumes=ep.consumes,
                     response_dto_fqn=m["return_type"],
+                    # the mapping annotation itself lives on the ancestor method, not
+                    # here — keep that truthful for evidence, even though the DI-trace
+                    # should start from the concrete controller/method above.
+                    annotation_class_id=src_method["class_id"],
+                    annotation_method_id=src_method["id"],
                     commit=False,
                 )
                 created += 1

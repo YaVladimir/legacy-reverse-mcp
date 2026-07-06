@@ -11,6 +11,9 @@ All tools return JSON. **Heuristic** tools always include `confidence`,
 - `confidence`: `"high" | "medium" | "low" | "unknown"` — see
   [confidence-model.md](confidence-model.md).
 - `evidence`: list of `{kind, description, file_path?, line_start?, line_end?, symbol?, source}`.
+- `file_path` (wherever it appears — evidence, class/method rows, config files, ...) is always
+  **repo-relative** (forward slashes), never absolute. Join it against the `--repo`/
+  `LEGACY_REVERSE_REPO` path if you need to open the file.
 - `limitations`: list of `{code, description}` — see [limitations.md](limitations.md).
 - Errors: `{ "error": "not_found", "kind": "...", "query": ..., "message": "...", "suggestions": [...] }`.
 

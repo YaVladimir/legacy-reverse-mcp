@@ -413,6 +413,7 @@ def main(argv: list[str] | None = None) -> None:  # noqa: C901 - linear orchestr
     }
     # keep the merged artifact under .reverse/ (gitignored), not the repo root
     merged_path = repo_path / ".reverse" / "arch-merged.json"
+    merged_path.parent.mkdir(parents=True, exist_ok=True)
     merged_path.write_text(json.dumps(merged, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"Merged JSON written to: {merged_path}")
 

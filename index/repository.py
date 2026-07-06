@@ -418,15 +418,21 @@ def insert_endpoint(
     request_dto_fqn: str | None = None,
     response_dto_fqn: str | None = None,
     deprecated: bool = False,
+    annotation_class_id: int | None = None,
+    annotation_method_id: int | None = None,
     commit: bool = True,
 ) -> int:
+    """``annotation_class_id``/``annotation_method_id`` record where the mapping
+    annotation itself lives; default to ``controller_class_id``/``handler_method_id``
+    (the common case: annotation is directly on the controller)."""
     cur = conn.execute(
         """
         INSERT INTO endpoint (
             http_method, path, full_path, controller_class_id, handler_method_id,
-            produces, consumes, request_dto_fqn, response_dto_fqn, deprecated
+            produces, consumes, request_dto_fqn, response_dto_fqn, deprecated,
+            annotation_class_id, annotation_method_id
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             http_method,
@@ -439,6 +445,8 @@ def insert_endpoint(
             request_dto_fqn,
             response_dto_fqn,
             int(deprecated),
+            annotation_class_id if annotation_class_id is not None else controller_class_id,
+            annotation_method_id if annotation_method_id is not None else handler_method_id,
         ),
     )
     if commit:

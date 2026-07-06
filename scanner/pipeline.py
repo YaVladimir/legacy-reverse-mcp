@@ -55,6 +55,10 @@ def build_index(conn, repo_path: str, progress=None, progress_every: int = 0) ->
     reattributed_endpoints = reattribute_interface_endpoints(conn)
     if reattributed_endpoints:
         echo(f"Reattributed {reattributed_endpoints} endpoint(s) from interface to implementing controller.")
+    # reattribution can both create (per concrete controller) and delete (claimed
+    # interface-level) endpoint rows, so the parse-time stats.endpoints count is
+    # stale afterwards -- recompute for the manifest and the returned summary.
+    total_endpoints = conn.execute("SELECT COUNT(*) FROM endpoint").fetchone()[0]
 
     echo("Scanning dependencies ...")
     dep_stats = index_dependencies(conn, repo_path)
@@ -99,7 +103,7 @@ def build_index(conn, repo_path: str, progress=None, progress_every: int = 0) ->
     conn.execute(
         "INSERT INTO scan_manifest (repo_path, build_tool, total_files, total_classes, total_endpoints) "
         "VALUES (?, ?, ?, ?, ?)",
-        (repo_path, result.build_tool, result.total_files, stats.classes, stats.endpoints),
+        (repo_path, result.build_tool, result.total_files, stats.classes, total_endpoints),
     )
     conn.commit()
 
@@ -109,7 +113,7 @@ def build_index(conn, repo_path: str, progress=None, progress_every: int = 0) ->
         "classes": stats.classes,
         "methods": stats.methods,
         "fields": stats.fields,
-        "endpoints": stats.endpoints,
+        "endpoints": total_endpoints,
         "observed_facts": stats.observed_facts,
         "method_calls": stats.method_calls,
         "class_edges": class_edges,
