@@ -80,6 +80,22 @@ def build_index(conn, repo_path: str, progress=None, progress_every: int = 0) ->
     package_summaries = generate_package_summaries(conn)
     echo(f"Summarized {class_summaries} class(es), {package_summaries} package(s).")
 
+    # a rebuilt index loses previously applied describe/import output; the durable
+    # store (descriptions.sqlite3) survives, so restore what is still fresh before
+    # the FTS build picks summaries up. No LLM. Local import: keeps scanner free of
+    # a summarizer-LLM dependency at module load.
+    from summarizer.describe import reapply_imported
+
+    restored = reapply_imported(conn, repo_path)
+    if restored["classes"] or restored["methods"]:
+        msg = (
+            f"Restored {restored['classes']} imported class / {restored['methods']} "
+            f"method description(s) from the durable store"
+        )
+        if restored["stale"]:
+            msg += f"; {restored['stale']} stale import(s) skipped"
+        echo(msg + ".")
+
     echo("Building search index ...")
     search_rows = build_search_index(conn)
     echo(f"Indexed {search_rows} searchable entit(ies).")
@@ -129,5 +145,6 @@ def build_index(conn, repo_path: str, progress=None, progress_every: int = 0) ->
         "search_rows": search_rows,
         "findings": findings,
         "inferred_findings": len(inferred),
+        "restored_descriptions": restored,
         "parse_failures": stats.files_failed,
     }

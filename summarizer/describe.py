@@ -152,6 +152,61 @@ def imported_for_class(
     return class_text, methods, stored_hash
 
 
+def reapply_imported(conn: sqlite3.Connection, repo_path: str | Path) -> dict:
+    """Re-apply descriptions from the durable imported store to a freshly built index.
+
+    A forced rescan rebuilds ``index.sqlite3`` from scratch, wiping the
+    ``class.summary``/``method.summary`` values a previous import/``describe`` had
+    applied — while ``descriptions.sqlite3`` survives. Called at the end of the
+    scan pipeline so imported descriptions don't silently vanish until the next
+    manual ``describe``/``import-arch`` run. No LLM involved; imports whose stored
+    :func:`structure_hash` no longer matches the current code are skipped, same
+    freshness rule as ``describe`` itself.
+    """
+    stats = {"classes": 0, "methods": 0, "stale": 0, "unmatched": 0}
+    cache_path = Path(repo_path) / _CACHE_RELATIVE
+    if not cache_path.exists():
+        return stats
+    repo_root = Path(repo_path).resolve()
+    cache = sqlite3.connect(cache_path)
+    cache.row_factory = sqlite3.Row
+    try:
+        # cache files created before imports existed have no imported_description
+        if not cache.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='imported_description'"
+        ).fetchone():
+            return stats
+        fqns = sorted({
+            r["ref_key"].split("#", 1)[0]
+            for r in cache.execute("SELECT ref_key FROM imported_description")
+        })
+        for fqn in fqns:
+            row = conn.execute("SELECT id FROM class WHERE fqn = ?", (fqn,)).fetchone()
+            if row is None:
+                stats["unmatched"] += 1
+                continue
+            class_text, methods, stored_hash = imported_for_class(cache, fqn)
+            skeleton = _class_skeleton(conn, row["id"])
+            if stored_hash is not None and stored_hash != structure_hash(
+                skeleton, _source_snippet(skeleton, repo_root)
+            ):
+                stats["stale"] += 1
+                continue
+            if class_text:
+                repo.set_class_summary(conn, row["id"], class_text, commit=False)
+                stats["classes"] += 1
+            sig_to_id = {m["signature"]: m["id"] for m in skeleton["methods"]}
+            for signature, text in methods.items():
+                method_id = sig_to_id.get(signature)
+                if method_id is not None:
+                    repo.set_method_summary(conn, method_id, text, commit=False)
+                    stats["methods"] += 1
+        conn.commit()
+    finally:
+        cache.close()
+    return stats
+
+
 def _cache_get(cache: sqlite3.Connection, ref_key: str, content_hash: str) -> dict | None:
     row = cache.execute(
         "SELECT content, content_hash FROM description_cache WHERE ref_key = ?", (ref_key,)

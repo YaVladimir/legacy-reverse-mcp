@@ -136,11 +136,14 @@ to `describe` (not `scan`) to ignore the cache.
 **`scan --force` deletes and rebuilds `index.sqlite3` from scratch** — this wipes
 any `describe` output already applied there (`class.summary`/`method.summary` and
 the module/project rows of the `summary` table; `scan` only ever regenerates the
-plain deterministic package-level summary on its own). The description *cache*
-survives, so **re-running `describe` after every `scan --force`** re-applies the
-same descriptions from cache almost instantly (no LLM re-spend for unchanged
-classes) — but skipping that re-run silently leaves you with only the bare
-deterministic fallback text and no module/project summaries at all. You can also
+plain deterministic package-level summary on its own). **Imported** descriptions
+(`import-arch`, `generate-arch`, batch generation) are restored automatically: at
+the end of every scan the pipeline re-applies still-fresh entries from the durable
+store (`descriptions.sqlite3`, which survives `scan --force`), skipping classes
+whose structure hash no longer matches the code. What is *not* auto-restored:
+descriptions produced by `describe`'s own LLM pass and the module/project summary
+rows — **re-run `describe` after `scan --force`** to get those back (cheap:
+content-hash cache hits mean no LLM re-spend for unchanged classes). You can also
 trigger `describe` over MCP with `generate_descriptions`.
 
 ### 2c. Flat architecture JSON — export / import / gigacode

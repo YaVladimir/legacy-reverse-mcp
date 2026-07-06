@@ -144,10 +144,13 @@ limitations, warnings }`. Run once after `scan_repository` (can be slow on large
 repos) — **and again after every subsequent `scan_repository(force=true)`**:
 `scan` rebuilds `index.sqlite3` from scratch, which wipes any previously-applied
 `class.summary`/`method.summary` and the module/project rows of the `summary`
-table (only the description *cache* file survives, not what's applied in the live
-index). A re-run after a forced rescan is cheap — cache hits mean no LLM re-spend
-for classes that didn't change — but skipping it silently leaves you with only
-the bare deterministic per-class text and no module/project summaries at all.
+table. **Imported** descriptions (`import_architecture`, gigacode/batch) are the
+exception — the scan pipeline auto-restores still-fresh ones from the surviving
+`descriptions.sqlite3` (stale imports, where the class changed, are skipped). A
+`describe` re-run after a forced rescan is cheap — cache hits mean no LLM
+re-spend for classes that didn't change — but skipping it leaves classes not
+covered by imports with only the bare deterministic text and no module/project
+summaries.
 
 ### `find_feature(topic, limit=20, methods_per_class=12)`
 Topic/feature → the classes that implement it, each as a compact card **with its
