@@ -84,16 +84,19 @@ def _chunk_prompt(chunk_path: Path, idx: int, total: int) -> str:
         f"Открой файл {chunk_path} — это фрагмент архитектуры Java-проекта "
         f"(часть {idx + 1} из {total}) в flat-JSON формате. "
         "Поле id каждого класса — путь к его исходнику относительно корня проекта "
-        "(добавь расширение .java). Для КАЖДОГО класса сначала открой и прочитай "
+        "БЕЗ расширения: чтобы найти файл, добавь к id расширение .java, но сам id "
+        "нигде не переписывай. Для КАЖДОГО класса сначала открой и прочитай "
         "его исходный файл, затем заполни поле description на русском языке: что "
         "делает класс, зачем он нужен, какую бизнес-задачу решает; укажи побочные "
         "эффекты (запись в БД, отправка в Kafka, вызовы внешних API, транзакционность) "
         "и инварианты, которые нужно сохранить при изменении кода. Для каждого метода — "
         "1-2 предложения о его логике по реальному коду. Если исходник не найден или "
         "логика неясна — опиши по сигнатуре и скажи об этом; ничего не выдумывай. "
-        "Верни ТОЛЬКО JSON в том же формате с заполненными description: не изменяй "
-        "id, pkg, name и sig, не добавляй и не удаляй классы и методы, без markdown "
-        "и пояснений."
+        "Верни ТОЛЬКО JSON в том же формате с заполненными description. Верни ВСЕ "
+        "классы входного файла — ответ с меньшим числом классов считается ошибкой. "
+        "id, pkg, name и sig скопируй в точности как во входном файле (id — без "
+        ".java): не изменяй id и сигнатуры, не добавляй и не удаляй классы и методы, "
+        "без markdown и пояснений."
     )
 
 
@@ -101,34 +104,57 @@ def _chunk_prompt(chunk_path: Path, idx: int, total: int) -> str:
 # response validation
 # ---------------------------------------------------------------------------
 
+def _normalize_id(cid: str) -> str:
+    """Chunk ids are extension-less repo-relative paths, but models routinely echo
+    them back cosmetically mutated (``.java`` appended, backslashes, ``./`` prefix)
+    — compare canonical forms so a cosmetic rewrite doesn't reject a whole chunk."""
+    cid = cid.replace("\\", "/").strip()
+    while cid.startswith("./"):
+        cid = cid[2:]
+    return cid[:-5] if cid.endswith(".java") else cid
+
+
 def _class_key(c: dict) -> str:
-    return c.get("id") or f"{c.get('pkg')}.{c.get('name')}"
+    cid = c.get("id")
+    return _normalize_id(str(cid)) if cid else f"{c.get('pkg')}.{c.get('name')}"
 
 
-def _validate_chunk_result(sent: list[dict], returned: dict | None) -> tuple[list[dict], dict]:
+def _validate_chunk_result(
+    sent: list[dict], returned: dict | None, seen: set[str] | None = None
+) -> tuple[list[dict], dict]:
     """Keep only returned classes that correspond to classes actually sent
-    (matched by id, falling back to pkg+name). A model that renamed, invented or
-    dropped classes must not smuggle descriptions onto the wrong symbols —
-    ``import_flat`` matches leniently by simple name, so garbage in would stick."""
+    (matched by normalized id, falling back to pkg+name). A model that renamed,
+    invented or dropped classes must not smuggle descriptions onto the wrong
+    symbols — ``import_flat`` matches leniently by simple name, so garbage in
+    would stick. ``seen`` is a cross-call accumulator: several results for the
+    same chunk (a partial first attempt + its retry) validate as a union without
+    double-accepting; ``missing`` then reflects what the union still lacks."""
+    seen = seen if seen is not None else set()
     info: dict[str, Any] = {"sent": len(sent), "returned": 0, "accepted": 0,
                             "extraneous": 0, "missing": []}
+    sent_keys = {_class_key(c) for c in sent}
+    name_to_key = {f"{c.get('pkg')}.{c.get('name')}": _class_key(c) for c in sent}
     if not returned or not isinstance(returned.get("classes"), list):
-        info["missing"] = sorted(_class_key(c) for c in sent)
+        info["missing"] = sorted(sent_keys - seen)
         return [], info
 
-    sent_keys = {_class_key(c) for c in sent}
     accepted: list[dict] = []
-    seen: set[str] = set()
     for c in returned["classes"]:
         if not isinstance(c, dict):
             continue
         info["returned"] += 1
         k = _class_key(c)
-        if k in sent_keys and k not in seen:
+        if k not in sent_keys:
+            # model rewrote the id beyond cosmetics (absolute path, wrong root):
+            # pkg+name still pins the class — the same identity import_flat uses
+            k = name_to_key.get(f"{c.get('pkg')}.{c.get('name')}", "")
+        if not k or k not in sent_keys:
+            info["extraneous"] += 1
+        elif k in seen:
+            continue  # already covered by an earlier attempt for this chunk
+        else:
             accepted.append(c)
             seen.add(k)
-        else:
-            info["extraneous"] += 1
     info["accepted"] = len(accepted)
     info["missing"] = sorted(sent_keys - seen)
     return accepted, info
@@ -339,18 +365,28 @@ def main(argv: list[str] | None = None) -> None:  # noqa: C901 - linear orchestr
 
         work_items: list[tuple[int, Path]] = []
         skip_count = 0
+        partial_retries = 0
         for i in range(n_chunks):
             chunk_path = work_dir / f"chunk-{i:04d}.json"
             if args.resume:
                 out_path = work_dir / f"chunk-{i:04d}-stdout.txt"
                 if out_path.exists():
                     existing = _extract_json(out_path.read_text(encoding="utf-8", errors="replace"))
-                    if existing and existing.get("classes"):
+                    _, vinfo = _validate_chunk_result(chunks[i], existing)
+                    if vinfo["accepted"] and not vinfo["missing"]:
                         skip_count += 1
                         continue
+                    if vinfo["accepted"]:
+                        # partially described (model returned fewer classes than
+                        # sent): keep what's already there, re-run the chunk so
+                        # the remainder gets a second chance
+                        raw_results.append((i, existing, {"resumed": True, "partial": True}))
+                        partial_retries += 1
             work_items.append((i, chunk_path))
         if skip_count:
             print(f"Skipping {skip_count} already-completed chunk(s) (resume mode)")
+        if partial_retries:
+            print(f"Re-running {partial_retries} partially-described chunk(s), existing descriptions kept")
 
         print(f"Starting {len(work_items)} GigaCode session(s), {args.parallel} at a time ...\n")
         progress = _Progress(len(work_items))
@@ -385,15 +421,25 @@ def main(argv: list[str] | None = None) -> None:  # noqa: C901 - linear orchestr
     dropped_extraneous = 0
     missing_classes: list[str] = []
 
-    raw_results.sort(key=lambda r: r[0])
+    results_by_chunk: dict[int, list[tuple[dict | None, dict]]] = {}
     for idx, data, info in raw_results:
-        accepted, vinfo = _validate_chunk_result(chunks[idx], data)
-        if not accepted:
+        results_by_chunk.setdefault(idx, []).append((data, info))
+
+    for idx in range(n_chunks):
+        # fresh runs first: a retried chunk's new result claims classes before the
+        # previously saved partial output fills in whatever is still missing
+        entries = sorted(results_by_chunk.get(idx, []), key=lambda e: bool(e[1].get("resumed")))
+        seen: set[str] = set()
+        chunk_accepted: list[dict] = []
+        for data, _info in entries:
+            accepted, vinfo = _validate_chunk_result(chunks[idx], data, seen)
+            chunk_accepted.extend(accepted)
+            dropped_extraneous += vinfo["extraneous"]
+        if not chunk_accepted:
             failed_chunks.append(idx)
             continue
-        merged_classes.extend(accepted)
-        dropped_extraneous += vinfo["extraneous"]
-        missing_classes.extend(vinfo["missing"])
+        merged_classes.extend(chunk_accepted)
+        missing_classes.extend(sorted({_class_key(c) for c in chunks[idx]} - seen))
 
     print(f"Merged: {len(merged_classes)}/{len(all_classes)} classes "
           f"from {n_chunks - len(failed_chunks)}/{n_chunks} chunks")
@@ -403,7 +449,8 @@ def main(argv: list[str] | None = None) -> None:  # noqa: C901 - linear orchestr
         print(f"Missing (sent but not described): {len(missing_classes)} — first: {missing_classes[:5]}")
     if failed_chunks:
         print(f"Failed chunks: {failed_chunks}")
-        print(f"Tip: re-run with --resume {work_dir} to retry only the failed chunks")
+    if failed_chunks or missing_classes:
+        print(f"Tip: re-run with --resume {work_dir} to retry failed and partially-described chunks")
 
     merged = {
         "project": project_name,
@@ -449,8 +496,9 @@ def main(argv: list[str] | None = None) -> None:  # noqa: C901 - linear orchestr
             conn.close()
 
     # 9. cleanup ---------------------------------------------------------------
-    # merge-only outputs were produced by someone else — never delete them here
-    keep = args.keep_chunks or bool(failed_chunks) or args.merge_only
+    # merge-only outputs were produced by someone else — never delete them here;
+    # missing classes need the work dir intact for a --resume retry
+    keep = args.keep_chunks or bool(failed_chunks) or bool(missing_classes) or args.merge_only
     if keep:
         print(f"Chunk files preserved in: {work_dir}")
     else:

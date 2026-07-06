@@ -81,6 +81,41 @@ def test_validate_matches_by_pkg_name_when_id_missing():
     assert len(accepted) == 1 and info["missing"] == []
 
 
+def test_validate_tolerates_cosmetic_id_rewrites():
+    """Real gigacode run: the model echoed ids with '.java' appended (and models
+    on Windows produce backslashes) — a whole chunk must not be rejected over a
+    cosmetic id rewrite."""
+    sent = [_cls(1), _cls(2)]
+    returned = {"classes": [
+        dict(_cls(1, described=True), id="src/main/java/ru/bank/C1.java"),
+        dict(_cls(2, described=True), id=".\\src\\main\\java\\ru\\bank\\C2"),
+    ]}
+    accepted, info = _validate_chunk_result(sent, returned)
+    assert [c["name"] for c in accepted] == ["C1", "C2"]
+    assert info["missing"] == [] and info["extraneous"] == 0
+
+
+def test_validate_falls_back_to_pkg_name_when_id_rewritten_beyond_cosmetics():
+    sent = [_cls(1)]
+    returned = {"classes": [dict(_cls(1, described=True), id="C:/somewhere/else/C1.java")]}
+    accepted, info = _validate_chunk_result(sent, returned)
+    assert len(accepted) == 1 and info["missing"] == []
+
+
+def test_validate_unions_partial_results_without_double_accept():
+    """A partial first attempt + its retry validate as a union via the shared
+    ``seen`` set: overlap isn't accepted twice, missing reflects the union."""
+    sent = [_cls(1), _cls(2), _cls(3)]
+    first = {"classes": [_cls(1, described=True), _cls(2, described=True)]}
+    second = {"classes": [_cls(2, described=True), _cls(3, described=True)]}
+    seen: set[str] = set()
+    acc1, info1 = _validate_chunk_result(sent, first, seen)
+    assert len(acc1) == 2 and info1["missing"] == ["src/main/java/ru/bank/C3"]
+    acc2, info2 = _validate_chunk_result(sent, second, seen)
+    assert [c["name"] for c in acc2] == ["C3"]  # C2 not accepted twice
+    assert info2["missing"] == []
+
+
 def test_merge_only_imports_outputs_from_disk(tmp_path, monkeypatch):
     """--merge-only: no GigaCode at all — validate/merge/import out-chunk files
     that another generator (e.g. a Claude agent) already wrote to the work dir."""
@@ -124,4 +159,6 @@ def test_prompt_demands_reading_sources_and_forbids_invention():
     assert ".java" in prompt                 # id -> source file to actually read
     assert "не выдумывай" in prompt          # anti-hallucination rule
     assert "не изменяй id" in prompt         # structure must round-trip for import
+    assert "БЕЗ расширения" in prompt        # ...and unambiguously: id has no .java
+    assert "ВСЕ классы" in prompt            # partial responses are an error
     assert "часть 1 из 4" in prompt
