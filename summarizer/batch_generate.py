@@ -341,6 +341,23 @@ def main(argv: list[str] | None = None) -> None:  # noqa: C901 - linear orchestr
         # runs): just read them back — out-chunk-NNNN.json first, then the
         # gigacode sidecar chunk-NNNN-stdout.txt
         print("Merge-only mode: reading existing chunk outputs from the work dir ...")
+        # ground truth for validation: the chunk files actually sent to the
+        # generator, when present — re-chunking arch.json with a different
+        # --chunk-size than the original run would shift every chunk boundary
+        # and mass-reject perfectly good outputs
+        disk_chunk_paths = sorted(work_dir.glob("chunk-????.json"))
+        if disk_chunk_paths:
+            try:
+                disk_chunks = [
+                    (json.loads(p.read_text(encoding="utf-8")) or {}).get("classes") or []
+                    for p in disk_chunk_paths
+                ]
+            except (json.JSONDecodeError, OSError) as exc:
+                print(f"WARNING: could not read chunk files ({exc}); validating against re-chunked arch.json")
+            else:
+                chunks = disk_chunks
+                n_chunks = len(chunks)
+                print(f"Validating against {n_chunks} chunk file(s) found in {work_dir}")
         for i in range(n_chunks):
             data = None
             for candidate in (work_dir / f"out-chunk-{i:04d}.json",

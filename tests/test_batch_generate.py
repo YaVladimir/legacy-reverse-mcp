@@ -154,6 +154,44 @@ def test_merge_only_imports_outputs_from_disk(tmp_path, monkeypatch):
     conn.close()
 
 
+def test_merge_only_validates_against_disk_chunks_not_current_chunk_size(tmp_path, monkeypatch):
+    """out-chunk files generated with one --chunk-size must merge fine even when
+    the merge-only run is invoked with a different --chunk-size: validation uses
+    the chunk files on disk as ground truth, not a re-chunked arch.json."""
+    monkeypatch.delenv("LEGACY_REVERSE_LLM_BASE_URL", raising=False)
+    repo = write_fixture_repo(tmp_path / "repo")
+    db = repo / ".reverse" / "index.sqlite3"
+    conn = init_db(db)
+    build_index(conn, str(repo))
+
+    arch = flat_arch.export_flat(conn, str(repo))
+    conn.close()
+    arch_path = tmp_path / "arch.json"
+    arch_path.write_text(json.dumps(arch, ensure_ascii=False), encoding="utf-8")
+
+    # original run used chunk-size 2 (5 classes -> 3 chunks) and left both the
+    # chunk files and the described outputs in the work dir
+    chunks = _chunk_classes(arch["classes"], 2)
+    work_dir = repo / ".reverse" / "batch"
+    work_dir.mkdir(parents=True)
+    for i, ch in enumerate(chunks):
+        (work_dir / f"chunk-{i:04d}.json").write_text(
+            json.dumps(_make_chunk_json(arch, ch), ensure_ascii=False), encoding="utf-8")
+        described = [dict(c, description=f"АГЕНТ: класс {c['name']}.") for c in ch]
+        (work_dir / f"out-chunk-{i:04d}.json").write_text(
+            json.dumps(_make_chunk_json(arch, described), ensure_ascii=False), encoding="utf-8")
+
+    # merge with a mismatching --chunk-size 4 — must still import everything
+    main([str(arch_path), "--repo", str(repo), "--merge-only",
+          "--chunk-size", "4", "--skip-describe"])
+
+    conn = get_conn(db)
+    row = conn.execute(
+        "SELECT summary FROM class WHERE simple_name = 'DepositService'").fetchone()
+    assert row["summary"] == "АГЕНТ: класс DepositService."
+    conn.close()
+
+
 def test_prompt_demands_reading_sources_and_forbids_invention():
     prompt = _chunk_prompt(Path("chunk-0000.json"), 0, 4)
     assert ".java" in prompt                 # id -> source file to actually read
