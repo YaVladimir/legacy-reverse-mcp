@@ -15,7 +15,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8"]
+dev = ["pytest>=8", "ruff>=0.5"]
 
 [project.scripts]
 legacy-reverse = "cli:cli"
@@ -36,3 +36,7 @@ index = ["schema.sql"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+
+[tool.ruff]
+target-version = "py311"
+extend-exclude = ["eval/fixture"]

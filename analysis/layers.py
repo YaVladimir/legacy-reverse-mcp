@@ -12,7 +12,7 @@ exactly the annotation / package / declaration that drove it.
 from __future__ import annotations
 
 from analysis.common import ev
-from models import ConfidenceLevel, Evidence, InferredFinding, Limitation, LIMITATIONS
+from models import ConfidenceLevel, Evidence, InferredFinding, LIMITATIONS
 
 # stereotype annotation (object value, with '@') -> layer + human label
 _STEREOTYPES: list[tuple[frozenset[str], str, str]] = [
