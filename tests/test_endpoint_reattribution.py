@@ -160,6 +160,122 @@ public class DealController implements DealsApi {
         conn.close()
 
 
+def test_interface_class_level_request_mapping_is_inherited(tmp_path):
+    """H3: the interface carries the type-level @RequestMapping('/api/v1') and the
+    concrete controller is bare. Spring serves /api/v1/deals — the reattributed row
+    must inherit the interface base path, not drop it to /deals."""
+    conn, summary = _scan(tmp_path / "repo", {
+        "pom.xml": _POM,
+        f"{_GEN}/DealsApi.java": """
+package ru.bank.api;
+
+import org.springframework.web.bind.annotation.*;
+
+@RequestMapping("/api/v1")
+public interface DealsApi {
+    @GetMapping("/deals")
+    String getDeals();
+}
+""",
+        f"{_SRC}/DealController.java": """
+package ru.bank.api;
+
+import org.springframework.web.bind.annotation.*;
+
+@RestController
+public class DealController implements DealsApi {
+    @Override
+    public String getDeals() { return "deals"; }
+}
+""",
+    })
+    try:
+        rows = conn.execute(
+            "SELECT controller_fqn, full_path FROM v_endpoint_full").fetchall()
+        got = [(r["controller_fqn"], r["full_path"]) for r in rows]
+        assert got == [("ru.bank.api.DealController", "/api/v1/deals")]
+    finally:
+        conn.close()
+
+
+def test_sibling_with_own_annotation_supersedes_interface_row(tmp_path):
+    """H4: one sibling overrides without an annotation (reattributed), the other
+    overrides *with its own* @GetMapping (indexed directly). Both represent the
+    interface method, so the interface row must be superseded — not linger as a
+    phantom third endpoint."""
+    conn, summary = _scan(tmp_path / "repo", {
+        "pom.xml": _POM,
+        f"{_GEN}/DealsApi.java": _DEALS_API,
+        f"{_SRC}/DealControllerA.java": """
+package ru.bank.api;
+
+import org.springframework.web.bind.annotation.*;
+
+@RestController
+@RequestMapping("/a")
+public class DealControllerA implements DealsApi {
+    @Override
+    public String getDeal(Long id) { return "deal"; }
+}
+""",
+        f"{_SRC}/DealControllerB.java": """
+package ru.bank.api;
+
+import org.springframework.web.bind.annotation.*;
+
+@RestController
+public class DealControllerB implements DealsApi {
+    @Override
+    @GetMapping("/b/deals/{id}")
+    public String getDeal(Long id) { return "deal"; }
+}
+""",
+    })
+    try:
+        got = {(r["controller_fqn"], r["full_path"]) for r in conn.execute(
+            "SELECT controller_fqn, full_path FROM v_endpoint_full")}
+        assert got == {
+            ("ru.bank.api.DealControllerA", "/a/deals/{id}"),  # reattributed
+            ("ru.bank.api.DealControllerB", "/b/deals/{id}"),  # own annotation
+        }
+        # the interface row is not deleted, only hidden (superseded)
+        interface_rows = conn.execute(
+            "SELECT e.superseded FROM endpoint e JOIN class c ON c.id = e.controller_class_id "
+            "WHERE c.fqn = 'ru.bank.api.DealsApi'").fetchall()
+        assert [r["superseded"] for r in interface_rows] == [1]
+    finally:
+        conn.close()
+
+
+def test_superseded_interface_row_is_kept_not_deleted(tmp_path):
+    """Full sibling coverage supersedes (hides) the interface row but never deletes
+    it: the raw endpoint table still holds it, so a heuristic mistake is recoverable."""
+    conn, _ = _scan(tmp_path / "repo", {
+        "pom.xml": _POM,
+        f"{_GEN}/DealsApi.java": _DEALS_API,
+        f"{_SRC}/DealController.java": """
+package ru.bank.api;
+
+import org.springframework.web.bind.annotation.*;
+
+@RestController
+@RequestMapping("/v1")
+public class DealController implements DealsApi {
+    @Override
+    public String getDeal(Long id) { return "deal"; }
+}
+""",
+    })
+    try:
+        total = conn.execute("SELECT COUNT(*) n FROM endpoint").fetchone()["n"]
+        superseded = conn.execute(
+            "SELECT COUNT(*) n FROM endpoint WHERE superseded = 1").fetchone()["n"]
+        visible = conn.execute("SELECT COUNT(*) n FROM v_endpoint_full").fetchone()["n"]
+        assert total == 2 and superseded == 1 and visible == 1
+    finally:
+        conn.close()
+
+
 def test_partial_sibling_coverage_preserves_interface_row(tmp_path):
     """One sibling overrides (gets its endpoint), the other only inherits the
     default method: the interface row must be kept for the second sibling."""

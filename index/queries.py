@@ -54,7 +54,9 @@ def project_overview(conn: sqlite3.Connection) -> dict:
     roles = {r["role"]: r["n"] for r in conn.execute("SELECT role, COUNT(*) n FROM class GROUP BY role")}
     endpoints_by_verb = {
         r["http_method"]: r["n"]
-        for r in conn.execute("SELECT http_method, COUNT(*) n FROM endpoint GROUP BY http_method")
+        for r in conn.execute(
+            "SELECT http_method, COUNT(*) n FROM endpoint WHERE superseded = 0 GROUP BY http_method"
+        )
     }
 
     top_modules = [
@@ -64,7 +66,7 @@ def project_overview(conn: sqlite3.Connection) -> dict:
             "       COUNT(DISTINCT e.id) ep "
             "FROM module mo "
             "LEFT JOIN class cl ON cl.module_id = mo.id "
-            "LEFT JOIN endpoint e ON e.controller_class_id = cl.id "
+            "LEFT JOIN endpoint e ON e.controller_class_id = cl.id AND e.superseded = 0 "
             "GROUP BY mo.id ORDER BY n DESC LIMIT 8"
         )
     ]
@@ -97,7 +99,7 @@ def project_overview(conn: sqlite3.Connection) -> dict:
             "modules": conn.execute("SELECT COUNT(*) FROM module").fetchone()[0],
             "classes": conn.execute("SELECT COUNT(*) FROM class").fetchone()[0],
             "methods": conn.execute("SELECT COUNT(*) FROM method").fetchone()[0],
-            "endpoints": conn.execute("SELECT COUNT(*) FROM endpoint").fetchone()[0],
+            "endpoints": conn.execute("SELECT COUNT(*) FROM endpoint WHERE superseded = 0").fetchone()[0],
         },
         "roles": roles,
         "endpoints_by_verb": endpoints_by_verb,
@@ -181,7 +183,8 @@ def module_map(conn: sqlite3.Connection) -> dict:
         r["module_id"]: r["n"]
         for r in conn.execute(
             "SELECT cl.module_id AS module_id, COUNT(*) n FROM endpoint e "
-            "JOIN class cl ON cl.id = e.controller_class_id GROUP BY cl.module_id"
+            "JOIN class cl ON cl.id = e.controller_class_id "
+            "WHERE e.superseded = 0 GROUP BY cl.module_id"
         )
     }
 

@@ -440,12 +440,36 @@ def reattribute_interface_endpoints(conn) -> int:
     ):
         param_types.setdefault(r["method_id"], []).append(_simple_type(r["type_fqn"]) or r["type_fqn"])
 
+    # preload every method/class annotation once (the reattribution BFS otherwise
+    # re-queries these per method, including deep inside the ancestor walk).
+    method_anns: dict[int, list[tuple[str, str | None]]] = {}
+    for r in conn.execute("SELECT method_id, name, attributes FROM method_annotation"):
+        method_anns.setdefault(r["method_id"], []).append((r["name"], r["attributes"]))
+    class_anns: dict[int, list[tuple[str, str | None]]] = {}
+    for r in conn.execute("SELECT class_id, name, attributes FROM class_annotation"):
+        class_anns.setdefault(r["class_id"], []).append((r["name"], r["attributes"]))
+
     def method_annotations(method_id: int) -> list[tuple[str, str | None]]:
-        return [
-            (r["name"], r["attributes"]) for r in conn.execute(
-                "SELECT name, attributes FROM method_annotation WHERE method_id = ?", (method_id,)
-            )
-        ]
+        return method_anns.get(method_id, [])
+
+    def type_base_path(class_id: int) -> str | None:
+        """The type-level base path Spring applies to ``class_id``'s handlers: the
+        class's own class-level @RequestMapping/@Path if it has one, otherwise the
+        nearest one inherited from an ancestor interface (openapi-generator puts
+        @RequestMapping('/api/v1') on the interface and leaves the impl bare). The
+        controller's own mapping wins over the interface's — same as Spring."""
+        seen: set[int] = set()
+        queue = deque([class_id])
+        while queue:
+            cid = queue.popleft()
+            if cid in seen:
+                continue
+            seen.add(cid)
+            bp = class_base_path(class_anns.get(cid, []))
+            if bp:
+                return bp
+            queue.extend(parents.get(cid, []))
+        return None
 
     def find_ancestor_endpoint(class_id: int, name: str, params: list[str]):
         """BFS the implements/extends chain for a same-name/same-parameter-types
@@ -481,29 +505,38 @@ def reattribute_interface_endpoints(conn) -> int:
 
     controller_ancestors = {cid: ancestor_closure(cid) for cid in controller_annotated}
 
-    # src_method_id -> controllers that produced a replacement for it, and the
-    # class owning that method — used at the end to decide what's safe to delete
+    # For each interface (ancestor) mapping method:
+    #   claims  — controllers that reattributed it (produced a replacement row);
+    #   covered — controllers that *represent* it, either by reattributing it OR by
+    #             overriding it with their own mapping annotation (H4: an override
+    #             carrying its own @GetMapping is indexed directly and no longer
+    #             needs the interface row, so it must count towards coverage).
+    # src_owner maps the method to the class that declares the annotation.
     claims: dict[int, set[int]] = {}
+    covered: dict[int, set[int]] = {}
     src_owner: dict[int, int] = {}
     created = 0
 
     for class_id in controller_annotated:
-        class_anns = [
-            (r["name"], r["attributes"]) for r in conn.execute(
-                "SELECT name, attributes FROM class_annotation WHERE class_id = ?", (class_id,)
-            )
-        ]
-        base_path = class_base_path(class_anns)
+        base_path = type_base_path(class_id)
 
         for m in methods_by_class.get(class_id, []):
-            if extract_endpoints(method_annotations(m["id"])):
-                continue  # already has its own mapping annotation, indexed correctly already
-
-            src_method, eps = find_ancestor_endpoint(class_id, m["name"], param_types.get(m["id"], []))
-            if not eps:
+            own_eps = extract_endpoints(method_annotations(m["id"]))
+            src_method, anc_eps = find_ancestor_endpoint(
+                class_id, m["name"], param_types.get(m["id"], [])
+            )
+            if own_eps:
+                # already indexed from its own mapping annotation; if it also
+                # overrides an ancestor mapping method, record that this controller
+                # covers the interface row so it can be superseded.
+                if src_method is not None and anc_eps:
+                    covered.setdefault(src_method["id"], set()).add(class_id)
+                    src_owner[src_method["id"]] = src_method["class_id"]
+                continue
+            if not anc_eps:
                 continue
 
-            for ep in eps:
+            for ep in anc_eps:
                 full_path = join_paths(base_path, ep.sub_path)
                 exists = conn.execute(
                     "SELECT 1 FROM endpoint WHERE controller_class_id = ? AND handler_method_id = ? "
@@ -532,21 +565,27 @@ def reattribute_interface_endpoints(conn) -> int:
                 created += 1
 
             claims.setdefault(src_method["id"], set()).add(class_id)
+            covered.setdefault(src_method["id"], set()).add(class_id)
             src_owner[src_method["id"]] = src_method["class_id"]
 
-    # drop an interface-level endpoint row only when EVERY controller behind that
-    # interface produced its own replacement. If a sibling didn't (it inherits the
-    # default method without overriding it — delegate pattern — or its interface
-    # link failed to resolve), the interface row stays as that sibling's only
-    # honest representation instead of vanishing from the index entirely.
-    for src_id, claimers in claims.items():
+    # Supersede (hide — never delete) an interface-level endpoint row only when
+    # EVERY controller behind that interface represents it (reattributed it or
+    # overrides it with its own mapping). If a sibling doesn't (it inherits the
+    # default method without overriding — delegate pattern — or its interface link
+    # failed to resolve), the interface row stays visible as that sibling's only
+    # honest representation. Superseding instead of deleting means a heuristic
+    # mistake degrades to a hidden-but-recoverable row, not a vanished endpoint.
+    for src_id, coverers in covered.items():
         owner = src_owner[src_id]
         implementors = {
             cid for cid, ancestors in controller_ancestors.items() if owner in ancestors
         }
-        if implementors - claimers:
+        if implementors - coverers:
             continue
-        conn.execute("DELETE FROM endpoint WHERE handler_method_id = ?", (src_id,))
+        conn.execute(
+            "UPDATE endpoint SET superseded = 1 WHERE handler_method_id = ? AND superseded = 0",
+            (src_id,),
+        )
 
     conn.commit()
     return created

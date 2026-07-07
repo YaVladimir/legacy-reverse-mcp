@@ -58,7 +58,7 @@ def build_index(conn, repo_path: str, progress=None, progress_every: int = 0) ->
     # reattribution can both create (per concrete controller) and delete (claimed
     # interface-level) endpoint rows, so the parse-time stats.endpoints count is
     # stale afterwards -- recompute for the manifest and the returned summary.
-    total_endpoints = conn.execute("SELECT COUNT(*) FROM endpoint").fetchone()[0]
+    total_endpoints = conn.execute("SELECT COUNT(*) FROM endpoint WHERE superseded = 0").fetchone()[0]
 
     echo("Scanning dependencies ...")
     dep_stats = index_dependencies(conn, repo_path)

@@ -49,10 +49,12 @@ def build_search_index(conn: sqlite3.Connection) -> int:
         [(r["id"], r["name"], r["fqn"], r["anns"], r["summary"] or "") for r in rows],
     )
 
-    # endpoints: name = full_path, annotations = http method
+    # endpoints: name = full_path, annotations = http method (skip superseded
+    # interface rows — they're duplicated by the reattributed controller rows)
     rows = conn.execute(
         "SELECT e.id, e.full_path, e.http_method, c.fqn AS controller "
-        "FROM endpoint e LEFT JOIN class c ON c.id = e.controller_class_id"
+        "FROM endpoint e LEFT JOIN class c ON c.id = e.controller_class_id "
+        "WHERE e.superseded = 0"
     )
     conn.executemany(
         "INSERT INTO search_index (entity_type, entity_id, name, fqn, annotations, summary) "

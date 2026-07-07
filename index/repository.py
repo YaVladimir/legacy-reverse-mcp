@@ -14,7 +14,41 @@ def get_conn(db_path: str | Path) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
+    _ensure_endpoint_schema(conn)
     return conn
+
+
+# expected columns of the current endpoint table / v_endpoint_full view; their
+# absence in an already-built index means it predates a schema addition and must
+# be migrated forward on open (read tools happily read old indexes without a
+# rescan, so a stale endpoint view would otherwise raise mid-query instead).
+_ENDPOINT_ADDED_COLUMNS = (
+    ("annotation_class_id", "INTEGER"),
+    ("annotation_method_id", "INTEGER"),
+    ("request_dto_fqn", "TEXT"),
+    ("superseded", "INTEGER NOT NULL DEFAULT 0"),
+)
+
+
+def _ensure_endpoint_schema(conn: sqlite3.Connection) -> None:
+    """Forward-migrate an older ``endpoint`` table + ``v_endpoint_full`` view in
+    place. Idempotent and a near-free no-op once the schema is current (only two
+    PRAGMA reads). Fixes reads of pre-supersede / pre-provenance indexes that the
+    read tools accept without a rescan."""
+    ep_cols = {r[1] for r in conn.execute("PRAGMA table_info(endpoint)")}
+    if not ep_cols:
+        return  # not an index database (or brand new) — nothing to migrate
+    view_cols = {r[1] for r in conn.execute("PRAGMA table_info(v_endpoint_full)")}
+    if "superseded" in ep_cols and "annotation_inherited" in view_cols:
+        return  # already current
+    for col, ddl in _ENDPOINT_ADDED_COLUMNS:
+        if col not in ep_cols:
+            conn.execute(f"ALTER TABLE endpoint ADD COLUMN {col} {ddl}")
+    # CREATE VIEW IF NOT EXISTS won't replace a stale definition — drop, then let
+    # the canonical schema recreate it (every other statement is idempotent).
+    conn.execute("DROP VIEW IF EXISTS v_endpoint_full")
+    conn.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
+    conn.commit()
 
 
 def init_db(db_path: str | Path) -> sqlite3.Connection:

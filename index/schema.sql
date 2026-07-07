@@ -179,7 +179,13 @@ CREATE TABLE IF NOT EXISTS endpoint (
     consumes        TEXT,
     request_dto_fqn  TEXT,
     response_dto_fqn TEXT,
-    deprecated      INTEGER NOT NULL DEFAULT 0
+    deprecated      INTEGER NOT NULL DEFAULT 0,
+    -- Hidden by default (v_endpoint_full filters it out) but kept, not deleted:
+    -- an interface-level endpoint row is *superseded* once every concrete
+    -- controller behind that interface has its own representation (a reattributed
+    -- row or its own mapping annotation). Keeping the row means a heuristic
+    -- mistake degrades to a hidden-but-recoverable row, never a vanished endpoint.
+    superseded      INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS idx_endpoint_path        ON endpoint(full_path);
@@ -413,7 +419,8 @@ FROM endpoint e
 LEFT JOIN class  c  ON c.id = e.controller_class_id
 LEFT JOIN method m  ON m.id = e.handler_method_id
 LEFT JOIN class  ac ON ac.id = e.annotation_class_id
-LEFT JOIN method am ON am.id = e.annotation_method_id;
+LEFT JOIN method am ON am.id = e.annotation_method_id
+WHERE e.superseded = 0;
 
 -- Классы с их модулями и пакетами
 CREATE VIEW IF NOT EXISTS v_class_full AS
