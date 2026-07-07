@@ -29,6 +29,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -40,7 +41,7 @@ from typing import Any
 
 from analysis.flat_arch import import_flat
 from index.repository import get_conn
-from summarizer.harness import HarnessConfig, _build_argv, _extract_json
+from summarizer.harness import HarnessConfig, _build_argv, _extract_json, gigacode_available
 
 _DEFAULT_CHUNK_SIZE = 25   # large chunks risk a truncated (unparseable) response
 _DEFAULT_PARALLEL = 5
@@ -70,6 +71,33 @@ def _write_chunk(chunk_dir: Path, idx: int, data: dict) -> Path:
     path = chunk_dir / f"chunk-{idx:04d}.json"
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     return path
+
+
+_CHUNK_FILE_RE = re.compile(r"chunk-(\d+)\.json$")
+
+
+def _chunk_file_index(path: Path) -> int | None:
+    """The numeric index encoded in a ``chunk-NNNN.json`` file name (None if it
+    doesn't match). Used to key chunks by their real number, not their position in
+    a sorted glob — a gap in the numbering must not shift every later chunk."""
+    m = _CHUNK_FILE_RE.search(path.name)
+    return int(m.group(1)) if m else None
+
+
+def _load_disk_chunks(work_dir: Path) -> dict[int, list[dict]]:
+    """Map ``chunk_index -> classes`` from the chunk files actually written to disk.
+    These are the ground truth for validation: they are exactly what was sent to the
+    generator, regardless of the current ``--chunk-size`` or a re-chunked arch.json."""
+    out: dict[int, list[dict]] = {}
+    for p in sorted(work_dir.glob("chunk-????.json")):
+        idx = _chunk_file_index(p)
+        if idx is None:
+            continue
+        try:
+            out[idx] = (json.loads(p.read_text(encoding="utf-8")) or {}).get("classes") or []
+        except (json.JSONDecodeError, OSError):
+            continue
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -187,7 +215,7 @@ def _run_single_chunk(
     try:
         proc = subprocess.run(
             argv, capture_output=True, text=True, encoding="utf-8", errors="replace",
-            timeout=config.timeout, cwd=config.cwd, env=os.environ.copy(),
+            timeout=config.timeout, cwd=config.cwd,
         )
     except subprocess.TimeoutExpired:
         info["error"] = f"gigacode timed out after {config.timeout:.0f}s"
@@ -197,12 +225,19 @@ def _run_single_chunk(
         return chunk_idx, None, info
 
     info["returncode"] = proc.returncode
-    # sidecar with raw stdout: debugging + what --resume checks for prior success
+    # sidecar with raw stdout: debugging + what --resume checks for prior success.
+    # Only overwrite it when the new output actually parses — otherwise an
+    # unparseable retry would clobber a previous good sidecar, and the next
+    # --resume would treat the chunk as never described (re-spending the LLM).
     sidecar = chunk_path.with_name(f"chunk-{chunk_idx:04d}-stdout.txt")
-    sidecar.write_text(proc.stdout or "", encoding="utf-8")
-
     data = _extract_json(proc.stdout or "")
-    if data is None:
+    if data is not None:
+        sidecar.write_text(proc.stdout or "", encoding="utf-8")
+    else:
+        # keep the failed output beside the good sidecar for debugging, not over it
+        sidecar.with_name(f"chunk-{chunk_idx:04d}-stdout.err.txt").write_text(
+            proc.stdout or "", encoding="utf-8"
+        )
         info["error"] = "gigacode produced no parseable flat JSON"
         info["stderr_tail"] = (proc.stderr or "").strip()[-400:]
     return chunk_idx, data, info
@@ -336,70 +371,74 @@ def main(argv: list[str] | None = None) -> None:  # noqa: C901 - linear orchestr
     project_name = original.get("project", "unknown")
     raw_results: list[tuple[int, dict | None, dict]] = []
 
+    # Ground truth for validation, keyed by real chunk index. A fresh run uses the
+    # slicing just computed; --resume / --merge-only prefer the chunk files already
+    # on disk (exactly what was sent), so a changed --chunk-size or a re-generated
+    # arch.json can't shift boundaries and mass-reject good outputs (and a gap in
+    # the numbering can't shift later chunks — indices come from the file names).
+    disk_by_idx = _load_disk_chunks(work_dir)
+    if (args.resume or args.merge_only) and disk_by_idx:
+        sent_by_idx = disk_by_idx
+    else:
+        sent_by_idx = {i: ch for i, ch in enumerate(chunks)}
+    chunk_indices = sorted(sent_by_idx)
+    total_chunks = len(chunk_indices)
+
     if args.merge_only:
         # outputs were produced elsewhere (another agent/model, manual gigacode
         # runs): just read them back — out-chunk-NNNN.json first, then the
         # gigacode sidecar chunk-NNNN-stdout.txt
         print("Merge-only mode: reading existing chunk outputs from the work dir ...")
-        # ground truth for validation: the chunk files actually sent to the
-        # generator, when present — re-chunking arch.json with a different
-        # --chunk-size than the original run would shift every chunk boundary
-        # and mass-reject perfectly good outputs
-        disk_chunk_paths = sorted(work_dir.glob("chunk-????.json"))
-        if disk_chunk_paths:
-            try:
-                disk_chunks = [
-                    (json.loads(p.read_text(encoding="utf-8")) or {}).get("classes") or []
-                    for p in disk_chunk_paths
-                ]
-            except (json.JSONDecodeError, OSError) as exc:
-                print(f"WARNING: could not read chunk files ({exc}); validating against re-chunked arch.json")
-            else:
-                chunks = disk_chunks
-                n_chunks = len(chunks)
-                print(f"Validating against {n_chunks} chunk file(s) found in {work_dir}")
-        for i in range(n_chunks):
+        if disk_by_idx:
+            print(f"Validating against {len(disk_by_idx)} chunk file(s) found in {work_dir}")
+        for idx in chunk_indices:
             data = None
-            for candidate in (work_dir / f"out-chunk-{i:04d}.json",
-                              work_dir / f"chunk-{i:04d}-stdout.txt"):
+            for candidate in (work_dir / f"out-chunk-{idx:04d}.json",
+                              work_dir / f"chunk-{idx:04d}-stdout.txt"):
                 if candidate.exists():
                     data = _extract_json(candidate.read_text(encoding="utf-8", errors="replace"))
                     if data:
                         break
-            raw_results.append((i, data, {}))
+            raw_results.append((idx, data, {}))
     else:
-        for i, ch in enumerate(chunks):
-            path = work_dir / f"chunk-{i:04d}.json"
+        for idx in chunk_indices:
+            path = work_dir / f"chunk-{idx:04d}.json"
             if args.resume and path.exists():
                 continue
-            _write_chunk(work_dir, i, _make_chunk_json(original, ch, project_name))
+            _write_chunk(work_dir, idx, _make_chunk_json(original, sent_by_idx[idx], project_name))
         print(f"Chunk files ready in {work_dir}")
 
-        if not shutil.which(gigacode_cmd):
-            print(f"\n'{gigacode_cmd}' not found on PATH — chunk files are ready for manual processing.")
+        # accept a gigacode installed only via GIGACODE/GIGACODE_CLI env (no PATH
+        # entry) — same availability rule the harness/MCP generate uses
+        if not gigacode_available(gigacode_cmd):
+            print(f"\n'{gigacode_cmd}' not found on PATH or via GIGACODE/GIGACODE_CLI — "
+                  "chunk files are ready for manual processing.")
             print(f"Run GigaCode on each chunk, then re-run with --resume {work_dir}")
             return
 
         work_items: list[tuple[int, Path]] = []
         skip_count = 0
         partial_retries = 0
-        for i in range(n_chunks):
-            chunk_path = work_dir / f"chunk-{i:04d}.json"
+        for idx in chunk_indices:
+            chunk_path = work_dir / f"chunk-{idx:04d}.json"
             if args.resume:
-                out_path = work_dir / f"chunk-{i:04d}-stdout.txt"
+                out_path = work_dir / f"chunk-{idx:04d}-stdout.txt"
                 if out_path.exists():
                     existing = _extract_json(out_path.read_text(encoding="utf-8", errors="replace"))
-                    _, vinfo = _validate_chunk_result(chunks[i], existing)
+                    _, vinfo = _validate_chunk_result(sent_by_idx[idx], existing)
                     if vinfo["accepted"] and not vinfo["missing"]:
+                        # fully described already — record it as a prior success and
+                        # don't re-run (no separate re-read pass needed afterwards)
+                        raw_results.append((idx, existing, {"resumed": True}))
                         skip_count += 1
                         continue
                     if vinfo["accepted"]:
                         # partially described (model returned fewer classes than
                         # sent): keep what's already there, re-run the chunk so
                         # the remainder gets a second chance
-                        raw_results.append((i, existing, {"resumed": True, "partial": True}))
+                        raw_results.append((idx, existing, {"resumed": True, "partial": True}))
                         partial_retries += 1
-            work_items.append((i, chunk_path))
+            work_items.append((idx, chunk_path))
         if skip_count:
             print(f"Skipping {skip_count} already-completed chunk(s) (resume mode)")
         if partial_retries:
@@ -410,7 +449,7 @@ def main(argv: list[str] | None = None) -> None:  # noqa: C901 - linear orchestr
 
         with ThreadPoolExecutor(max_workers=args.parallel) as pool:
             future_map = {
-                pool.submit(_run_single_chunk, chunk_path, chunk_idx, n_chunks,
+                pool.submit(_run_single_chunk, chunk_path, chunk_idx, total_chunks,
                             gigacode_cmd, gigacode_args, args.timeout, cwd): chunk_idx
                 for chunk_idx, chunk_path in work_items
             }
@@ -423,15 +462,6 @@ def main(argv: list[str] | None = None) -> None:  # noqa: C901 - linear orchestr
                 progress.tick(result[1] is not None)
         print(progress.done_line())
 
-        # resumed chunks count as prior successes: re-read their sidecars
-        for i in range(n_chunks):
-            if not any(r[0] == i for r in raw_results):
-                out_path = work_dir / f"chunk-{i:04d}-stdout.txt"
-                if out_path.exists():
-                    existing = _extract_json(out_path.read_text(encoding="utf-8", errors="replace"))
-                    if existing:
-                        raw_results.append((i, existing, {"resumed": True}))
-
     # 7. validate + merge -----------------------------------------------------
     merged_classes: list[dict] = []
     failed_chunks: list[int] = []
@@ -442,24 +472,24 @@ def main(argv: list[str] | None = None) -> None:  # noqa: C901 - linear orchestr
     for idx, data, info in raw_results:
         results_by_chunk.setdefault(idx, []).append((data, info))
 
-    for idx in range(n_chunks):
+    for idx in chunk_indices:
         # fresh runs first: a retried chunk's new result claims classes before the
         # previously saved partial output fills in whatever is still missing
         entries = sorted(results_by_chunk.get(idx, []), key=lambda e: bool(e[1].get("resumed")))
         seen: set[str] = set()
         chunk_accepted: list[dict] = []
         for data, _info in entries:
-            accepted, vinfo = _validate_chunk_result(chunks[idx], data, seen)
+            accepted, vinfo = _validate_chunk_result(sent_by_idx[idx], data, seen)
             chunk_accepted.extend(accepted)
             dropped_extraneous += vinfo["extraneous"]
         if not chunk_accepted:
             failed_chunks.append(idx)
             continue
         merged_classes.extend(chunk_accepted)
-        missing_classes.extend(sorted({_class_key(c) for c in chunks[idx]} - seen))
+        missing_classes.extend(sorted({_class_key(c) for c in sent_by_idx[idx]} - seen))
 
     print(f"Merged: {len(merged_classes)}/{len(all_classes)} classes "
-          f"from {n_chunks - len(failed_chunks)}/{n_chunks} chunks")
+          f"from {total_chunks - len(failed_chunks)}/{total_chunks} chunks")
     if dropped_extraneous:
         print(f"Dropped {dropped_extraneous} extraneous/renamed class(es) returned by the model")
     if missing_classes:
@@ -469,12 +499,7 @@ def main(argv: list[str] | None = None) -> None:  # noqa: C901 - linear orchestr
     if failed_chunks or missing_classes:
         print(f"Tip: re-run with --resume {work_dir} to retry failed and partially-described chunks")
 
-    merged = {
-        "project": project_name,
-        "generated_at": original.get("generated_at", ""),
-        "total_classes": len(merged_classes),
-        "classes": merged_classes,
-    }
+    merged = _make_chunk_json(original, merged_classes, project_name)
     # keep the merged artifact under .reverse/ (gitignored), not the repo root
     merged_path = repo_path / ".reverse" / "arch-merged.json"
     merged_path.parent.mkdir(parents=True, exist_ok=True)
