@@ -20,7 +20,8 @@ The *flat* schema mirrors the reference produced by the GigaCode
   so ``find_feature`` / ``get_class_card`` / ``explain_class`` serve them and a later
   ``describe`` keeps them (imported wins over LLM/fallback).
 
-Class matching: by ``fqn = pkg + "." + name`` (fallback: simple name). Method matching:
+Class matching: by ``id`` (repo-relative source path -> ``class.file_path``) first,
+then ``fqn = pkg + "." + name``, then simple name. Method matching:
 by name, disambiguating overloads by parameter *type* simple-names (parameter names and
 return type are ignored, since the reference ``sig`` is ``name(Type paramName)``).
 """
@@ -149,13 +150,47 @@ def _entry_fqn(entry: dict) -> str:
     return f"{pkg}.{name}" if pkg else name
 
 
-def _resolve_class_row(conn: sqlite3.Connection, fqn: str, name: str | None) -> sqlite3.Row | None:
-    row = conn.execute("SELECT id, fqn FROM class WHERE fqn = ?", (fqn,)).fetchone()
-    if row is None and name:
-        row = conn.execute(
+def _normalize_id(cid: str) -> str:
+    """A flat ``id`` is an extension-less repo-relative source path (see _flat_id);
+    tolerate the cosmetic mutations a model/export may introduce (``.java`` suffix,
+    backslashes, ``./`` prefix) so it lines up with ``class.file_path``."""
+    cid = cid.replace("\\", "/").strip()
+    while cid.startswith("./"):
+        cid = cid[2:]
+    return cid[:-5] if cid.endswith(".java") else cid
+
+
+def _resolve_class_row(conn: sqlite3.Connection, entry: dict) -> sqlite3.Row | None:
+    """Resolve a flat-JSON class entry to an index class row.
+
+    Priority is ``id`` first: it maps to ``class.file_path`` (repo-relative source
+    path) and is the most reliable key — gigacode's architecture-generator returns
+    a correct ``id`` even when it drops ``pkg`` entirely, which would otherwise make
+    a whole class unmatchable. Falls back to ``pkg+name`` (fqn), then simple name."""
+    cid = entry.get("id")
+    name = entry.get("name")
+    if cid:
+        want = _normalize_id(str(cid)) + ".java"
+        rows = conn.execute(
+            "SELECT id, fqn, simple_name FROM class WHERE file_path = ?", (want,)
+        ).fetchall()
+        if len(rows) == 1:
+            return rows[0]
+        if len(rows) > 1 and name:  # several classes in one file: disambiguate by name
+            for r in rows:
+                if r["simple_name"] == name:
+                    return r
+
+    fqn = entry.get("fqn") or _entry_fqn(entry)
+    if fqn:
+        row = conn.execute("SELECT id, fqn FROM class WHERE fqn = ?", (fqn,)).fetchone()
+        if row is not None:
+            return row
+    if name:
+        return conn.execute(
             "SELECT id, fqn FROM class WHERE simple_name = ? ORDER BY fqn LIMIT 1", (name,)
         ).fetchone()
-    return row
+    return None
 
 
 def import_flat(
@@ -179,11 +214,12 @@ def import_flat(
         for entry in classes:
             if not isinstance(entry, dict):
                 continue
-            fqn = entry.get("fqn") or _entry_fqn(entry)
-            row = _resolve_class_row(conn, fqn, entry.get("name"))
+            row = _resolve_class_row(conn, entry)
             if row is None:
                 if len(stats["unmatched_classes"]) < 25:
-                    stats["unmatched_classes"].append(fqn)
+                    stats["unmatched_classes"].append(
+                        entry.get("fqn") or _entry_fqn(entry) or str(entry.get("id") or "")
+                    )
                 continue
             class_id, class_fqn = row["id"], row["fqn"]
 

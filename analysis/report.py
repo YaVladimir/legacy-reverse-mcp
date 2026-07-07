@@ -69,7 +69,7 @@ def _inventory(conn) -> dict:
         "services": roles.get("service", 0),
         "repositories": roles.get("repository", 0),
         "entities": roles.get("entity", 0),
-        "endpoints": _scalar(conn, "SELECT COUNT(*) FROM endpoint"),
+        "endpoints": _scalar(conn, "SELECT COUNT(*) FROM endpoint WHERE superseded = 0"),
         "scheduled_jobs": _scalar(conn, "SELECT COUNT(*) FROM method_annotation WHERE name = '@Scheduled'"),
         "message_listeners": _scalar(
             conn,
@@ -92,7 +92,7 @@ def _top_modules(conn, limit=10):
         for r in conn.execute(
             "SELECT mo.name, COUNT(DISTINCT cl.id) n, COUNT(DISTINCT e.id) ep "
             "FROM module mo LEFT JOIN class cl ON cl.module_id = mo.id "
-            "LEFT JOIN endpoint e ON e.controller_class_id = cl.id "
+            "LEFT JOIN endpoint e ON e.controller_class_id = cl.id AND e.superseded = 0 "
             "GROUP BY mo.id ORDER BY n DESC LIMIT ?",
             (limit,),
         )
@@ -112,7 +112,7 @@ def _top_packages(conn, limit=10):
 
 def _api_surface(conn, limit=20):
     by_verb = {r["http_method"]: r["n"] for r in conn.execute(
-        "SELECT http_method, COUNT(*) n FROM endpoint GROUP BY http_method")}
+        "SELECT http_method, COUNT(*) n FROM endpoint WHERE superseded = 0 GROUP BY http_method")}
     sample = [
         {"http_method": r["http_method"], "path": r["full_path"], "controller": r["controller_fqn"]}
         for r in conn.execute(

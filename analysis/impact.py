@@ -132,7 +132,7 @@ def change_impact(conn: sqlite3.Connection, symbol: str, limit: int = 60) -> dic
     for r in conn.execute(
         f"SELECT e.id, e.http_method, e.full_path, e.controller_class_id, c.simple_name AS ctrl "
         f"FROM endpoint e JOIN class c ON c.id = e.controller_class_id "
-        f"WHERE e.controller_class_id IN ({ph2}) ORDER BY e.full_path LIMIT ?",
+        f"WHERE e.controller_class_id IN ({ph2}) AND e.superseded = 0 ORDER BY e.full_path LIMIT ?",
         controller_ids + [limit],
     ):
         key = (r["http_method"], r["full_path"])

@@ -86,7 +86,7 @@ def generate_class_summaries(conn: sqlite3.Connection) -> int:
     endpoints: dict[int, list[dict]] = {}
     for r in conn.execute(
         "SELECT controller_class_id AS cid, http_method, full_path FROM endpoint "
-        "WHERE controller_class_id IS NOT NULL ORDER BY full_path"
+        "WHERE controller_class_id IS NOT NULL AND superseded = 0 ORDER BY full_path"
     ):
         endpoints.setdefault(r["cid"], []).append(
             {"http_method": r["http_method"], "full_path": r["full_path"]}

@@ -18,8 +18,21 @@ _CODEGEN_ALLOWED_CHILD = {
 }
 
 
-def _is_ignored_path(path: Path) -> bool:
-    parts = path.parts
+def _relative_parts(path: Path, repo_root: Path | None) -> tuple[str, ...]:
+    """Path components *relative to the repo root* — so ignore rules apply only to
+    directories inside the repo, never to the (irrelevant) directories the clone
+    happens to sit under. A repo cloned into ``C:\\ci\\build\\myrepo`` must not have
+    every file rejected because ``build`` appears above its root."""
+    if repo_root is None:
+        return path.parts
+    try:
+        return path.resolve().relative_to(Path(repo_root).resolve()).parts
+    except (ValueError, OSError):
+        return path.parts
+
+
+def _is_ignored_path(path: Path, repo_root: Path | None = None) -> bool:
+    parts = _relative_parts(path, repo_root)
     for i, part in enumerate(parts):
         if part in IGNORED_DIRS:
             return True
@@ -31,11 +44,14 @@ def _is_ignored_path(path: Path) -> bool:
     return False
 
 
-def prune_dirnames(dirpath: Path, dirnames: list[str]) -> None:
+def prune_dirnames(dirpath: Path, dirnames: list[str], repo_root: Path | None = None) -> None:
     """In-place ``os.walk`` dirnames filter: drop ignored dirs, and inside a
     build-output dir (``build``, ``target``) keep only its codegen child (so
-    generated sources are visible, other build output isn't)."""
-    allowed_child = _CODEGEN_ALLOWED_CHILD.get(dirpath.name)
+    generated sources are visible, other build output isn't). The build-output
+    policy never applies to the repo root itself — a repo *named* ``build`` or
+    ``target`` must not have its own ``src/`` pruned away on the first walk step."""
+    is_root = repo_root is not None and Path(dirpath).resolve() == Path(repo_root).resolve()
+    allowed_child = _CODEGEN_ALLOWED_CHILD.get(dirpath.name) if not is_root else None
     if allowed_child is not None:
         dirnames[:] = [d for d in dirnames if d == allowed_child]
     else:
@@ -107,10 +123,10 @@ def _parse_gradle_name(build_file: Path) -> dict:
     return info
 
 
-def _count_java_files(module_dir: Path) -> int:
+def _count_java_files(module_dir: Path, repo_root: Path | None = None) -> int:
     count = 0
     for path in module_dir.rglob("*.java"):
-        if _is_ignored_path(path):
+        if _is_ignored_path(path, repo_root):
             continue
         count += 1
     return count
@@ -154,19 +170,19 @@ def scan_repo(repo_path: str) -> ScanResult:
             artifact_id=info.get("artifact_id"),
             version=info.get("version"),
             packaging=info.get("packaging"),
-            java_file_count=_count_java_files(dirpath),
+            java_file_count=_count_java_files(dirpath, root),
         )
         modules.append(module)
 
     for path in root.rglob("*"):
-        if path.is_file() and not _is_ignored_path(path):
+        if path.is_file() and not _is_ignored_path(path, root):
             total_files += 1
 
     if modules:
         result.build_tool = modules[0].build_tool if len(modules) == 1 else _majority_build_tool(modules)
     result.modules = modules
     result.total_files = total_files
-    result.total_java_files = sum(m.java_file_count for m in modules) if modules else _count_java_files(root)
+    result.total_java_files = sum(m.java_file_count for m in modules) if modules else _count_java_files(root, root)
 
     return result
 
@@ -174,7 +190,7 @@ def scan_repo(repo_path: str) -> ScanResult:
 def _walk_dirs(root: Path):
     for dirpath, dirnames, _ in __import__("os").walk(root):
         p = Path(dirpath)
-        prune_dirnames(p, dirnames)
+        prune_dirnames(p, dirnames, root)
         if p == root:
             continue
         yield p

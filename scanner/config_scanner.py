@@ -68,11 +68,11 @@ def _is_config_name(name: str) -> bool:
 
 def _walk_config_files(root: Path):
     for dirpath, dirnames, filenames in os.walk(root):
-        prune_dirnames(Path(dirpath), dirnames)
+        prune_dirnames(Path(dirpath), dirnames, root)
         for name in filenames:
             if _is_config_name(name):
                 candidate = Path(dirpath) / name
-                if not _is_ignored_path(candidate):
+                if not _is_ignored_path(candidate, root):
                     yield candidate
 
 

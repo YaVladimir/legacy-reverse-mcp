@@ -22,7 +22,9 @@ from index.queries import _PERSISTENCE_TYPES, _simple_type
 def _resolve_endpoint(conn, endpoint_id, http_method, path_contains):
     if endpoint_id is not None:
         return conn.execute("SELECT * FROM endpoint WHERE id = ?", (endpoint_id,)).fetchone()
-    query = "SELECT * FROM endpoint WHERE 1=1"
+    # exclude superseded interface rows: they're duplicated by (and less accurate
+    # than) the reattributed controller rows
+    query = "SELECT * FROM endpoint WHERE superseded = 0"
     params: list = []
     if http_method:
         query += " AND http_method = ?"
@@ -109,7 +111,8 @@ def trace_endpoint(
         sample = [
             {"id": r["id"], "endpoint": f"{r['http_method']} {r['full_path']}"}
             for r in conn.execute(
-                "SELECT id, http_method, full_path FROM endpoint ORDER BY full_path LIMIT 8"
+                "SELECT id, http_method, full_path FROM endpoint WHERE superseded = 0 "
+                "ORDER BY full_path LIMIT 8"
             )
         ]
         return not_found(
@@ -119,6 +122,15 @@ def trace_endpoint(
         )
 
     full = conn.execute("SELECT * FROM v_endpoint_full WHERE id = ?", (ep["id"],)).fetchone()
+    if full is None or "annotation_inherited" not in full.keys():
+        # the endpoint is superseded (hidden from the view), or the index predates
+        # the current endpoint view and wasn't migrated on open — either way, give a
+        # structured, actionable error instead of raising mid-trace.
+        return not_found(
+            "endpoint",
+            {"endpoint_id": endpoint_id, "http_method": http_method, "path_contains": path_contains},
+            [{"suggestion": "re-run scan to rebuild the endpoint index"}],
+        )
     controller_id = ep["controller_class_id"]
     handler_id = ep["handler_method_id"]
     controller_fqn = full["controller_fqn"]

@@ -12,7 +12,12 @@ from index.findings import detect_findings
 from index.search import build_search_index
 from scanner.config_scanner import index_config
 from scanner.dependency_scanner import index_dependencies
-from scanner.java_indexer import index_class_dependencies, index_repo, reattribute_interface_endpoints
+from scanner.java_indexer import (
+    index_class_dependencies,
+    index_repo,
+    reattribute_interface_endpoints,
+    resolve_same_package_types,
+)
 from scanner.repo_scanner import scan_repo
 from summarizer.class_summary import generate_class_summaries
 from summarizer.package_summary import generate_package_summaries
@@ -48,6 +53,12 @@ def build_index(conn, repo_path: str, progress=None, progress_every: int = 0) ->
     if stats.files_failed:
         echo(f"  ! {stats.files_failed} file(s) failed to parse.")
 
+    # resolve same-package types to FQNs before edges are derived from them, so a
+    # sibling-class reference links precisely instead of over-approximating by name.
+    same_pkg_resolved = resolve_same_package_types(conn)
+    if same_pkg_resolved:
+        echo(f"Resolved {same_pkg_resolved} same-package type reference(s) to FQN.")
+
     echo("Linking class dependencies ...")
     class_edges = index_class_dependencies(conn)
     echo(f"Linked {class_edges} class-to-class edge(s).")
@@ -58,7 +69,7 @@ def build_index(conn, repo_path: str, progress=None, progress_every: int = 0) ->
     # reattribution can both create (per concrete controller) and delete (claimed
     # interface-level) endpoint rows, so the parse-time stats.endpoints count is
     # stale afterwards -- recompute for the manifest and the returned summary.
-    total_endpoints = conn.execute("SELECT COUNT(*) FROM endpoint").fetchone()[0]
+    total_endpoints = conn.execute("SELECT COUNT(*) FROM endpoint WHERE superseded = 0").fetchone()[0]
 
     echo("Scanning dependencies ...")
     dep_stats = index_dependencies(conn, repo_path)
@@ -82,11 +93,13 @@ def build_index(conn, repo_path: str, progress=None, progress_every: int = 0) ->
 
     # a rebuilt index loses previously applied describe/import output; the durable
     # store (descriptions.sqlite3) survives, so restore what is still fresh before
-    # the FTS build picks summaries up. No LLM. Local import: keeps scanner free of
-    # a summarizer-LLM dependency at module load.
+    # the FTS build picks summaries up. No LLM. reapply_imported is best-effort and
+    # already degrades a broken cache to a warning in its stats, never raising.
     from summarizer.describe import reapply_imported
 
     restored = reapply_imported(conn, repo_path)
+    if restored.get("error"):
+        echo(f"  ! imported-description restore skipped: {restored['error']}")
     if restored["classes"] or restored["methods"]:
         msg = (
             f"Restored {restored['classes']} imported class / {restored['methods']} "

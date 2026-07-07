@@ -64,7 +64,7 @@ def _resolve_module(rel_path: str, lookup: list[tuple[int, str]]) -> int | None:
 
 def _iter_java_files(repo_root: Path, skip_tests: bool):
     for dirpath, dirnames, filenames in os.walk(repo_root):
-        prune_dirnames(Path(dirpath), dirnames)
+        prune_dirnames(Path(dirpath), dirnames, repo_root)
         if skip_tests:
             parts = Path(dirpath).parts
             # skip standard test source roots: .../src/test/...
@@ -79,7 +79,7 @@ def _iter_java_files(repo_root: Path, skip_tests: bool):
                 # prune_dirnames only prunes subdirectories to recurse into; a stray
                 # .java file directly inside an otherwise-ignored dir (e.g. build/
                 # itself, not build/generated/) would still be yielded without this.
-                if not _is_ignored_path(candidate):
+                if not _is_ignored_path(candidate, repo_root):
                     yield candidate
 
 
@@ -308,6 +308,81 @@ def index_repo(
     return stats
 
 
+def _is_bare_identifier(t: str) -> bool:
+    """A plain simple type name — no package, generics, array or wildcard. Only
+    these are candidates for same-package FQN resolution."""
+    return bool(t) and t.isidentifier()
+
+
+def resolve_same_package_types(conn) -> int:
+    """Second pass: resolve a written type that has no import because it lives in the
+    *same package* as the declaring class (Java doesn't require an import for that).
+
+    ``_resolve_types_inplace`` only rewrites types reachable through the file's
+    ``import`` statements, so a field/return/parameter typed as a sibling class stays
+    a bare simple name while a cross-package one becomes an FQN — an inconsistency
+    that leaks into class-dependency edges and the exported flat JSON. This runs once
+    the whole project is indexed (so every class fqn is known): for each bare simple
+    type on a class in package P, if ``P.<Simple>`` is a real class, rewrite it to
+    that FQN. Types with no owning package, or that don't resolve, are left as-is —
+    the existing simple-name fallback still covers them.
+    """
+    known_fqns = {r["fqn"] for r in conn.execute("SELECT fqn FROM class")}
+    resolved = 0
+
+    def resolve(rows, table: str) -> None:
+        nonlocal resolved
+        updates: list[tuple[str, int]] = []
+        for r in rows:
+            t = r["type_fqn"]
+            pkg = r["pkg"]
+            if not pkg or not t or not _is_bare_identifier(t):
+                continue
+            candidate = f"{pkg}.{t}"
+            if candidate in known_fqns:
+                updates.append((candidate, r["id"]))
+        for fqn, row_id in updates:
+            conn.execute(f"UPDATE {table} SET type_fqn = ? WHERE id = ?", (fqn, row_id))
+        resolved += len(updates)
+
+    resolve(
+        conn.execute(
+            "SELECT f.id, f.type_fqn, p.fqn AS pkg FROM field f "
+            "JOIN class c ON c.id = f.class_id LEFT JOIN package p ON p.id = c.package_id "
+            "WHERE f.type_fqn IS NOT NULL AND f.type_fqn NOT LIKE '%.%'"
+        ).fetchall(),
+        "field",
+    )
+    resolve(
+        conn.execute(
+            "SELECT mp.id, mp.type_fqn, p.fqn AS pkg FROM method_parameter mp "
+            "JOIN method m ON m.id = mp.method_id JOIN class c ON c.id = m.class_id "
+            "LEFT JOIN package p ON p.id = c.package_id "
+            "WHERE mp.type_fqn IS NOT NULL AND mp.type_fqn NOT LIKE '%.%'"
+        ).fetchall(),
+        "method_parameter",
+    )
+    # method.return_type lives under a different column name — adapt the rows
+    ret_rows = conn.execute(
+        "SELECT m.id, m.return_type AS type_fqn, p.fqn AS pkg FROM method m "
+        "JOIN class c ON c.id = m.class_id LEFT JOIN package p ON p.id = c.package_id "
+        "WHERE m.return_type IS NOT NULL AND m.return_type NOT LIKE '%.%'"
+    ).fetchall()
+    ret_updates = 0
+    for r in ret_rows:
+        t, pkg = r["type_fqn"], r["pkg"]
+        if not pkg or not _is_bare_identifier(t):
+            continue
+        candidate = f"{pkg}.{t}"
+        if candidate in known_fqns:
+            conn.execute("UPDATE method SET return_type = ? WHERE id = ?", (candidate, r["id"]))
+            ret_updates += 1
+    resolved += ret_updates
+
+    conn.commit()
+    return resolved
+
+
 def index_class_dependencies(conn) -> int:
     """Post-pass: derive intra-project class->class edges from already-indexed data.
 
@@ -440,12 +515,36 @@ def reattribute_interface_endpoints(conn) -> int:
     ):
         param_types.setdefault(r["method_id"], []).append(_simple_type(r["type_fqn"]) or r["type_fqn"])
 
+    # preload every method/class annotation once (the reattribution BFS otherwise
+    # re-queries these per method, including deep inside the ancestor walk).
+    method_anns: dict[int, list[tuple[str, str | None]]] = {}
+    for r in conn.execute("SELECT method_id, name, attributes FROM method_annotation"):
+        method_anns.setdefault(r["method_id"], []).append((r["name"], r["attributes"]))
+    class_anns: dict[int, list[tuple[str, str | None]]] = {}
+    for r in conn.execute("SELECT class_id, name, attributes FROM class_annotation"):
+        class_anns.setdefault(r["class_id"], []).append((r["name"], r["attributes"]))
+
     def method_annotations(method_id: int) -> list[tuple[str, str | None]]:
-        return [
-            (r["name"], r["attributes"]) for r in conn.execute(
-                "SELECT name, attributes FROM method_annotation WHERE method_id = ?", (method_id,)
-            )
-        ]
+        return method_anns.get(method_id, [])
+
+    def type_base_path(class_id: int) -> str | None:
+        """The type-level base path Spring applies to ``class_id``'s handlers: the
+        class's own class-level @RequestMapping/@Path if it has one, otherwise the
+        nearest one inherited from an ancestor interface (openapi-generator puts
+        @RequestMapping('/api/v1') on the interface and leaves the impl bare). The
+        controller's own mapping wins over the interface's — same as Spring."""
+        seen: set[int] = set()
+        queue = deque([class_id])
+        while queue:
+            cid = queue.popleft()
+            if cid in seen:
+                continue
+            seen.add(cid)
+            bp = class_base_path(class_anns.get(cid, []))
+            if bp:
+                return bp
+            queue.extend(parents.get(cid, []))
+        return None
 
     def find_ancestor_endpoint(class_id: int, name: str, params: list[str]):
         """BFS the implements/extends chain for a same-name/same-parameter-types
@@ -481,29 +580,38 @@ def reattribute_interface_endpoints(conn) -> int:
 
     controller_ancestors = {cid: ancestor_closure(cid) for cid in controller_annotated}
 
-    # src_method_id -> controllers that produced a replacement for it, and the
-    # class owning that method — used at the end to decide what's safe to delete
+    # For each interface (ancestor) mapping method:
+    #   claims  — controllers that reattributed it (produced a replacement row);
+    #   covered — controllers that *represent* it, either by reattributing it OR by
+    #             overriding it with their own mapping annotation (H4: an override
+    #             carrying its own @GetMapping is indexed directly and no longer
+    #             needs the interface row, so it must count towards coverage).
+    # src_owner maps the method to the class that declares the annotation.
     claims: dict[int, set[int]] = {}
+    covered: dict[int, set[int]] = {}
     src_owner: dict[int, int] = {}
     created = 0
 
     for class_id in controller_annotated:
-        class_anns = [
-            (r["name"], r["attributes"]) for r in conn.execute(
-                "SELECT name, attributes FROM class_annotation WHERE class_id = ?", (class_id,)
-            )
-        ]
-        base_path = class_base_path(class_anns)
+        base_path = type_base_path(class_id)
 
         for m in methods_by_class.get(class_id, []):
-            if extract_endpoints(method_annotations(m["id"])):
-                continue  # already has its own mapping annotation, indexed correctly already
-
-            src_method, eps = find_ancestor_endpoint(class_id, m["name"], param_types.get(m["id"], []))
-            if not eps:
+            own_eps = extract_endpoints(method_annotations(m["id"]))
+            src_method, anc_eps = find_ancestor_endpoint(
+                class_id, m["name"], param_types.get(m["id"], [])
+            )
+            if own_eps:
+                # already indexed from its own mapping annotation; if it also
+                # overrides an ancestor mapping method, record that this controller
+                # covers the interface row so it can be superseded.
+                if src_method is not None and anc_eps:
+                    covered.setdefault(src_method["id"], set()).add(class_id)
+                    src_owner[src_method["id"]] = src_method["class_id"]
+                continue
+            if not anc_eps:
                 continue
 
-            for ep in eps:
+            for ep in anc_eps:
                 full_path = join_paths(base_path, ep.sub_path)
                 exists = conn.execute(
                     "SELECT 1 FROM endpoint WHERE controller_class_id = ? AND handler_method_id = ? "
@@ -532,21 +640,27 @@ def reattribute_interface_endpoints(conn) -> int:
                 created += 1
 
             claims.setdefault(src_method["id"], set()).add(class_id)
+            covered.setdefault(src_method["id"], set()).add(class_id)
             src_owner[src_method["id"]] = src_method["class_id"]
 
-    # drop an interface-level endpoint row only when EVERY controller behind that
-    # interface produced its own replacement. If a sibling didn't (it inherits the
-    # default method without overriding it — delegate pattern — or its interface
-    # link failed to resolve), the interface row stays as that sibling's only
-    # honest representation instead of vanishing from the index entirely.
-    for src_id, claimers in claims.items():
+    # Supersede (hide — never delete) an interface-level endpoint row only when
+    # EVERY controller behind that interface represents it (reattributed it or
+    # overrides it with its own mapping). If a sibling doesn't (it inherits the
+    # default method without overriding — delegate pattern — or its interface link
+    # failed to resolve), the interface row stays visible as that sibling's only
+    # honest representation. Superseding instead of deleting means a heuristic
+    # mistake degrades to a hidden-but-recoverable row, not a vanished endpoint.
+    for src_id, coverers in covered.items():
         owner = src_owner[src_id]
         implementors = {
             cid for cid, ancestors in controller_ancestors.items() if owner in ancestors
         }
-        if implementors - claimers:
+        if implementors - coverers:
             continue
-        conn.execute("DELETE FROM endpoint WHERE handler_method_id = ?", (src_id,))
+        conn.execute(
+            "UPDATE endpoint SET superseded = 1 WHERE handler_method_id = ? AND superseded = 0",
+            (src_id,),
+        )
 
     conn.commit()
     return created
