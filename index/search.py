@@ -9,7 +9,26 @@ from __future__ import annotations
 import re
 import sqlite3
 
-_TOKEN = re.compile(r"[A-Za-z0-9_]+")
+# \w is Unicode-aware: query terms may be Russian (descriptions are generated in
+# ru by default), not just ASCII identifiers.
+_TOKEN = re.compile(r"\w+")
+
+# CamelCase / digit-boundary splitter for Java identifiers (ASCII only — Java
+# names are ASCII; prose is already tokenized fine by unicode61).
+_SUBWORD = re.compile(r"[A-Z]+(?![a-z])|[A-Z][a-z0-9]*|[a-z0-9]+")
+
+
+def _subwords(token: str) -> list[str]:
+    return _SUBWORD.findall(token)
+
+
+def _with_subwords(name: str) -> str:
+    """`DepositAccountService` -> `DepositAccountService Deposit Account Service`,
+    so mid-name terms (`account`) match. FTS5 tokenizes the whole identifier as a
+    single token, which only prefix queries can hit; consumers never display this
+    column (they re-fetch by entity_id), so enriching it is invisible to users."""
+    parts = _subwords(name)
+    return f"{name} {' '.join(parts)}" if len(parts) > 1 else name
 
 
 def build_search_index(conn: sqlite3.Connection) -> int:
@@ -29,7 +48,7 @@ def build_search_index(conn: sqlite3.Connection) -> int:
     conn.executemany(
         "INSERT INTO search_index (entity_type, entity_id, name, fqn, annotations, summary) "
         "VALUES ('class', ?, ?, ?, ?, ?)",
-        [(r["id"], r["simple_name"], r["fqn"], r["anns"], r["summary"] or "") for r in rows],
+        [(r["id"], _with_subwords(r["simple_name"]), r["fqn"], r["anns"], r["summary"] or "") for r in rows],
     )
 
     # methods: fqn = ClassFqn#method; summary (when described) makes meaning searchable
@@ -46,7 +65,7 @@ def build_search_index(conn: sqlite3.Connection) -> int:
     conn.executemany(
         "INSERT INTO search_index (entity_type, entity_id, name, fqn, annotations, summary) "
         "VALUES ('method', ?, ?, ?, ?, ?)",
-        [(r["id"], r["name"], r["fqn"], r["anns"], r["summary"] or "") for r in rows],
+        [(r["id"], _with_subwords(r["name"]), r["fqn"], r["anns"], r["summary"] or "") for r in rows],
     )
 
     # endpoints: name = full_path, annotations = http method (skip superseded
@@ -68,11 +87,19 @@ def build_search_index(conn: sqlite3.Connection) -> int:
 
 
 def _to_match_query(query: str) -> str:
-    """Turn a free-text query into a forgiving FTS5 MATCH expression (prefix OR)."""
+    """Turn a free-text query into a forgiving FTS5 MATCH expression (prefix OR).
+    CamelCase terms also match as a subword phrase, so `DepositAccount` finds the
+    `Deposit Account Service` expansion written by :func:`_with_subwords`."""
     terms = _TOKEN.findall(query)
     if not terms:
         return '""'
-    return " OR ".join(f'"{t}"*' for t in terms)
+    alts: list[str] = []
+    for t in terms:
+        alts.append(f'"{t}"*')
+        parts = _subwords(t)
+        if len(parts) > 1:
+            alts.append('"' + " ".join(parts) + '"*')
+    return " OR ".join(alts)
 
 
 def search(

@@ -3,7 +3,6 @@ LLM + durable cache), full structural surfacing and topic->code find_feature."""
 
 from __future__ import annotations
 
-import io
 import json
 
 import pytest

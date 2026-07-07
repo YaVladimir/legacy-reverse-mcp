@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 from analysis.report import collect_baseline, render_markdown, write_baseline
 from index.repository import init_db
@@ -13,8 +14,9 @@ def test_report_written_in_both_formats(scan_summary_and_conn, tmp_path):
     _, conn = scan_summary_and_conn
     out = write_baseline(conn, tmp_path, report_dir=tmp_path / "reports")
 
-    md = (tmp_path / "reports" / "baseline.md").read_text(encoding="utf-8")
-    js = json.loads((tmp_path / "reports" / "baseline.json").read_text(encoding="utf-8"))
+    assert Path(out["markdown_path"]) == tmp_path / "reports" / "baseline.md"
+    md = Path(out["markdown_path"]).read_text(encoding="utf-8")
+    js = json.loads(Path(out["json_path"]).read_text(encoding="utf-8"))
 
     assert md.startswith("# Legacy Reverse Baseline")
     assert "## Inventory" in md
