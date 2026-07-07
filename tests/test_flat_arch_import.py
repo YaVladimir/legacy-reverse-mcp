@@ -5,8 +5,6 @@ simple name alone would leave such a class unmatched or land it on the wrong one
 
 from __future__ import annotations
 
-from pathlib import Path
-
 from analysis.flat_arch import export_flat, import_flat
 from index.repository import init_db
 from scanner.pipeline import build_index
