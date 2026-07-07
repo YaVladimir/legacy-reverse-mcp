@@ -308,6 +308,81 @@ def index_repo(
     return stats
 
 
+def _is_bare_identifier(t: str) -> bool:
+    """A plain simple type name — no package, generics, array or wildcard. Only
+    these are candidates for same-package FQN resolution."""
+    return bool(t) and t.isidentifier()
+
+
+def resolve_same_package_types(conn) -> int:
+    """Second pass: resolve a written type that has no import because it lives in the
+    *same package* as the declaring class (Java doesn't require an import for that).
+
+    ``_resolve_types_inplace`` only rewrites types reachable through the file's
+    ``import`` statements, so a field/return/parameter typed as a sibling class stays
+    a bare simple name while a cross-package one becomes an FQN — an inconsistency
+    that leaks into class-dependency edges and the exported flat JSON. This runs once
+    the whole project is indexed (so every class fqn is known): for each bare simple
+    type on a class in package P, if ``P.<Simple>`` is a real class, rewrite it to
+    that FQN. Types with no owning package, or that don't resolve, are left as-is —
+    the existing simple-name fallback still covers them.
+    """
+    known_fqns = {r["fqn"] for r in conn.execute("SELECT fqn FROM class")}
+    resolved = 0
+
+    def resolve(rows, table: str) -> None:
+        nonlocal resolved
+        updates: list[tuple[str, int]] = []
+        for r in rows:
+            t = r["type_fqn"]
+            pkg = r["pkg"]
+            if not pkg or not t or not _is_bare_identifier(t):
+                continue
+            candidate = f"{pkg}.{t}"
+            if candidate in known_fqns:
+                updates.append((candidate, r["id"]))
+        for fqn, row_id in updates:
+            conn.execute(f"UPDATE {table} SET type_fqn = ? WHERE id = ?", (fqn, row_id))
+        resolved += len(updates)
+
+    resolve(
+        conn.execute(
+            "SELECT f.id, f.type_fqn, p.fqn AS pkg FROM field f "
+            "JOIN class c ON c.id = f.class_id LEFT JOIN package p ON p.id = c.package_id "
+            "WHERE f.type_fqn IS NOT NULL AND f.type_fqn NOT LIKE '%.%'"
+        ).fetchall(),
+        "field",
+    )
+    resolve(
+        conn.execute(
+            "SELECT mp.id, mp.type_fqn, p.fqn AS pkg FROM method_parameter mp "
+            "JOIN method m ON m.id = mp.method_id JOIN class c ON c.id = m.class_id "
+            "LEFT JOIN package p ON p.id = c.package_id "
+            "WHERE mp.type_fqn IS NOT NULL AND mp.type_fqn NOT LIKE '%.%'"
+        ).fetchall(),
+        "method_parameter",
+    )
+    # method.return_type lives under a different column name — adapt the rows
+    ret_rows = conn.execute(
+        "SELECT m.id, m.return_type AS type_fqn, p.fqn AS pkg FROM method m "
+        "JOIN class c ON c.id = m.class_id LEFT JOIN package p ON p.id = c.package_id "
+        "WHERE m.return_type IS NOT NULL AND m.return_type NOT LIKE '%.%'"
+    ).fetchall()
+    ret_updates = 0
+    for r in ret_rows:
+        t, pkg = r["type_fqn"], r["pkg"]
+        if not pkg or not _is_bare_identifier(t):
+            continue
+        candidate = f"{pkg}.{t}"
+        if candidate in known_fqns:
+            conn.execute("UPDATE method SET return_type = ? WHERE id = ?", (candidate, r["id"]))
+            ret_updates += 1
+    resolved += ret_updates
+
+    conn.commit()
+    return resolved
+
+
 def index_class_dependencies(conn) -> int:
     """Post-pass: derive intra-project class->class edges from already-indexed data.
 

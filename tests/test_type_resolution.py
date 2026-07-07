@@ -32,6 +32,67 @@ def _build(tmp_path):
     return conn
 
 
+def _build_same_package(tmp_path):
+    files = {
+        # SomeBuilder is in the same package as the class using it (no import needed
+        # in Java), so it must still resolve to the package-qualified FQN.
+        "src/main/java/com/ex/SomeBuilder.java": "package com.ex;\npublic class SomeBuilder {}\n",
+        "src/main/java/com/ex/SomeCheck.java": (
+            "package com.ex;\n"
+            "import org.springframework.beans.factory.annotation.Autowired;\n"
+            "public class SomeCheck {\n"
+            "    @Autowired\n"
+            "    private SomeBuilder someBuilder;\n"
+            "    public SomeBuilder make(SomeBuilder in) { return in; }\n"
+            "}\n"
+        ),
+    }
+    for rel, content in files.items():
+        p = tmp_path / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(content, encoding="utf-8")
+    conn = init_db(tmp_path / ".reverse" / "index.sqlite3")
+    build_index(conn, str(tmp_path))
+    return conn
+
+
+def test_same_package_field_type_resolves_to_fqn(tmp_path):
+    conn = _build_same_package(tmp_path)
+    try:
+        field_type = conn.execute(
+            "SELECT type_fqn FROM field WHERE name = 'someBuilder'"
+        ).fetchone()["type_fqn"]
+        assert field_type == "com.ex.SomeBuilder"  # not the bare 'SomeBuilder'
+
+        # return type and parameter type of the same-package method resolve too
+        m = conn.execute(
+            "SELECT id, return_type FROM method WHERE name = 'make'"
+        ).fetchone()
+        assert m["return_type"] == "com.ex.SomeBuilder"
+        param_type = conn.execute(
+            "SELECT type_fqn FROM method_parameter WHERE method_id = ?", (m["id"],)
+        ).fetchone()["type_fqn"]
+        assert param_type == "com.ex.SomeBuilder"
+    finally:
+        conn.close()
+
+
+def test_same_package_dependency_edge_is_precise(tmp_path):
+    conn = _build_same_package(tmp_path)
+    try:
+        targets = {
+            r["target"] for r in conn.execute(
+                "SELECT c2.fqn AS target FROM class_dependency cd "
+                "JOIN class c1 ON c1.id = cd.from_class_id "
+                "JOIN class c2 ON c2.id = cd.to_class_id "
+                "WHERE c1.simple_name = 'SomeCheck' AND cd.kind = 'field_injection'"
+            )
+        }
+        assert targets == {"com.ex.SomeBuilder"}
+    finally:
+        conn.close()
+
+
 def test_field_type_resolves_to_imported_fqn(tmp_path):
     conn = _build(tmp_path)
     try:

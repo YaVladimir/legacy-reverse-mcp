@@ -12,7 +12,12 @@ from index.findings import detect_findings
 from index.search import build_search_index
 from scanner.config_scanner import index_config
 from scanner.dependency_scanner import index_dependencies
-from scanner.java_indexer import index_class_dependencies, index_repo, reattribute_interface_endpoints
+from scanner.java_indexer import (
+    index_class_dependencies,
+    index_repo,
+    reattribute_interface_endpoints,
+    resolve_same_package_types,
+)
 from scanner.repo_scanner import scan_repo
 from summarizer.class_summary import generate_class_summaries
 from summarizer.package_summary import generate_package_summaries
@@ -47,6 +52,12 @@ def build_index(conn, repo_path: str, progress=None, progress_every: int = 0) ->
     )
     if stats.files_failed:
         echo(f"  ! {stats.files_failed} file(s) failed to parse.")
+
+    # resolve same-package types to FQNs before edges are derived from them, so a
+    # sibling-class reference links precisely instead of over-approximating by name.
+    same_pkg_resolved = resolve_same_package_types(conn)
+    if same_pkg_resolved:
+        echo(f"Resolved {same_pkg_resolved} same-package type reference(s) to FQN.")
 
     echo("Linking class dependencies ...")
     class_edges = index_class_dependencies(conn)

@@ -21,8 +21,12 @@ def test_controller_is_high_confidence_with_evidence(scan_summary_and_conn):
     assert "@RestController" in {
         f["object"] for f in res["observed_facts"] if f["fact_type"] == "class_annotation"
     }
-    # related symbols: injected service, syntactic calls, endpoints
-    assert any(d["type"] == "DepositService" for d in res["related_symbols"]["injected_dependencies"])
+    # related symbols: injected service, syntactic calls, endpoints. The service is
+    # in the controller's own package, so its type resolves to the FQN (M7).
+    assert any(
+        d["type"] == "ru.bank.deposit.DepositService"
+        for d in res["related_symbols"]["injected_dependencies"]
+    )
     assert any(c["symbol"] == "DepositService#create" for c in res["related_symbols"]["called_methods"])
     assert len(res["related_symbols"]["endpoints"]) == 2
     assert res["limitations"]

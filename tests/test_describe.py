@@ -156,7 +156,8 @@ def test_class_detail_surfaces_extends_and_params(scan_summary_and_conn):
     d = queries.class_detail(conn, "DepositController")
     assert "extends" in d and "implements" in d and d["type"] == d["role"]
     m = next(m for m in d["methods"] if m["name"] == "createDeposit")
-    assert m["parameters"] == [{"name": "req", "type": "DepositRequest"}]
+    # DepositRequest is in the same package, so its type resolves to the FQN (M7)
+    assert m["parameters"] == [{"name": "req", "type": "ru.bank.deposit.DepositRequest"}]
 
 
 # ------------------------------------------------------------
