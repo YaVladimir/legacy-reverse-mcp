@@ -7,8 +7,12 @@ agent can react to them.
 
 ## Not done (by design)
 
-- **No bytecode analysis.** Only `.java` sources are parsed. Generated code,
-  compiled-only dependencies and annotation-processor output are invisible.
+- **No bytecode analysis.** Only `.java` sources are parsed; compiled-only
+  dependencies are invisible. Generated Java *sources* are the exception: those
+  written under `build/generated/**` (Gradle) and `target/generated-sources/**`
+  (Maven) **are** indexed — but only if the project has been built, so their
+  presence and freshness track the last build (`generated_code_build_dependent`).
+  The rest of `build/`/`target/` (compiled classes, reports) stays ignored.
 - **No runtime Spring resolution.** Proxies, AOP advice, `@Profile`/`@Conditional`
   beans, `@Bean` factory methods and dynamic wiring are not resolved
   (`spring_proxies`).
@@ -23,8 +27,10 @@ agent can react to them.
 
 - **Interface → implementation** is resolved by naming convention (`*Impl`), not
   JDT/bytecode (`interface_impl_unresolved`).
-- **Type references are resolved via imports to FQNs** where possible. Only types
-  that stay unresolved (no matching import, or wildcard imports) fall back to
+- **Type references are resolved to FQNs** where possible: via the file's imports,
+  and — for a type in the declaring class's own package, which needs no import — by
+  matching it against a project class in that package. Only types that stay
+  unresolved (no import, wildcard import, or an external type) fall back to
   simple-name matching, which over-approximates — linking all candidates rather
   than missing one (`ambiguous_simple_name`).
 - **Constructor injection** is detected for Lombok

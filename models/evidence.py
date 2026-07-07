@@ -150,6 +150,10 @@ LIMITATIONS: dict[str, Limitation] = {
             code="config_not_resolved",
             description="Config is read statically: ${...} placeholders are not resolved, and profile activation / import / override precedence is not computed.",
         ),
+        Limitation(
+            code="generated_code_build_dependent",
+            description="Generated Java sources under build/generated (Gradle) and target/generated-sources (Maven) are indexed, but only if the project was built — their presence and freshness depend on the last build.",
+        ),
     ]
 }
 
