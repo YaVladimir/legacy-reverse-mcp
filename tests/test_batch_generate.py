@@ -81,6 +81,41 @@ def test_validate_matches_by_pkg_name_when_id_missing():
     assert len(accepted) == 1 and info["missing"] == []
 
 
+def test_validate_tolerates_cosmetic_id_rewrites():
+    """Real gigacode run: the model echoed ids with '.java' appended (and models
+    on Windows produce backslashes) — a whole chunk must not be rejected over a
+    cosmetic id rewrite."""
+    sent = [_cls(1), _cls(2)]
+    returned = {"classes": [
+        dict(_cls(1, described=True), id="src/main/java/ru/bank/C1.java"),
+        dict(_cls(2, described=True), id=".\\src\\main\\java\\ru\\bank\\C2"),
+    ]}
+    accepted, info = _validate_chunk_result(sent, returned)
+    assert [c["name"] for c in accepted] == ["C1", "C2"]
+    assert info["missing"] == [] and info["extraneous"] == 0
+
+
+def test_validate_falls_back_to_pkg_name_when_id_rewritten_beyond_cosmetics():
+    sent = [_cls(1)]
+    returned = {"classes": [dict(_cls(1, described=True), id="C:/somewhere/else/C1.java")]}
+    accepted, info = _validate_chunk_result(sent, returned)
+    assert len(accepted) == 1 and info["missing"] == []
+
+
+def test_validate_unions_partial_results_without_double_accept():
+    """A partial first attempt + its retry validate as a union via the shared
+    ``seen`` set: overlap isn't accepted twice, missing reflects the union."""
+    sent = [_cls(1), _cls(2), _cls(3)]
+    first = {"classes": [_cls(1, described=True), _cls(2, described=True)]}
+    second = {"classes": [_cls(2, described=True), _cls(3, described=True)]}
+    seen: set[str] = set()
+    acc1, info1 = _validate_chunk_result(sent, first, seen)
+    assert len(acc1) == 2 and info1["missing"] == ["src/main/java/ru/bank/C3"]
+    acc2, info2 = _validate_chunk_result(sent, second, seen)
+    assert [c["name"] for c in acc2] == ["C3"]  # C2 not accepted twice
+    assert info2["missing"] == []
+
+
 def test_merge_only_imports_outputs_from_disk(tmp_path, monkeypatch):
     """--merge-only: no GigaCode at all — validate/merge/import out-chunk files
     that another generator (e.g. a Claude agent) already wrote to the work dir."""
@@ -119,9 +154,49 @@ def test_merge_only_imports_outputs_from_disk(tmp_path, monkeypatch):
     conn.close()
 
 
+def test_merge_only_validates_against_disk_chunks_not_current_chunk_size(tmp_path, monkeypatch):
+    """out-chunk files generated with one --chunk-size must merge fine even when
+    the merge-only run is invoked with a different --chunk-size: validation uses
+    the chunk files on disk as ground truth, not a re-chunked arch.json."""
+    monkeypatch.delenv("LEGACY_REVERSE_LLM_BASE_URL", raising=False)
+    repo = write_fixture_repo(tmp_path / "repo")
+    db = repo / ".reverse" / "index.sqlite3"
+    conn = init_db(db)
+    build_index(conn, str(repo))
+
+    arch = flat_arch.export_flat(conn, str(repo))
+    conn.close()
+    arch_path = tmp_path / "arch.json"
+    arch_path.write_text(json.dumps(arch, ensure_ascii=False), encoding="utf-8")
+
+    # original run used chunk-size 2 (5 classes -> 3 chunks) and left both the
+    # chunk files and the described outputs in the work dir
+    chunks = _chunk_classes(arch["classes"], 2)
+    work_dir = repo / ".reverse" / "batch"
+    work_dir.mkdir(parents=True)
+    for i, ch in enumerate(chunks):
+        (work_dir / f"chunk-{i:04d}.json").write_text(
+            json.dumps(_make_chunk_json(arch, ch), ensure_ascii=False), encoding="utf-8")
+        described = [dict(c, description=f"АГЕНТ: класс {c['name']}.") for c in ch]
+        (work_dir / f"out-chunk-{i:04d}.json").write_text(
+            json.dumps(_make_chunk_json(arch, described), ensure_ascii=False), encoding="utf-8")
+
+    # merge with a mismatching --chunk-size 4 — must still import everything
+    main([str(arch_path), "--repo", str(repo), "--merge-only",
+          "--chunk-size", "4", "--skip-describe"])
+
+    conn = get_conn(db)
+    row = conn.execute(
+        "SELECT summary FROM class WHERE simple_name = 'DepositService'").fetchone()
+    assert row["summary"] == "АГЕНТ: класс DepositService."
+    conn.close()
+
+
 def test_prompt_demands_reading_sources_and_forbids_invention():
     prompt = _chunk_prompt(Path("chunk-0000.json"), 0, 4)
     assert ".java" in prompt                 # id -> source file to actually read
     assert "не выдумывай" in prompt          # anti-hallucination rule
     assert "не изменяй id" in prompt         # structure must round-trip for import
+    assert "БЕЗ расширения" in prompt        # ...and unambiguously: id has no .java
+    assert "ВСЕ классы" in prompt            # partial responses are an error
     assert "часть 1 из 4" in prompt
