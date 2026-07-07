@@ -1,5 +1,24 @@
 # Changelog
 
+## Unreleased — search recall fixes (Cyrillic + CamelCase) and CLI version
+
+### Fixed
+- **Russian topic queries returned nothing** (`index/search.py`): the query
+  tokenizer was ASCII-only, so `find_feature("банкротство")` /
+  `find_code_areas` with a Russian term produced an empty FTS MATCH — despite
+  descriptions being generated in Russian by default exactly for such queries.
+  The tokenizer is now Unicode (`\w+`).
+- **Mid-name terms now match identifiers**: `search_index` rows carry a CamelCase
+  subword expansion (`DepositAccountService` → `... Deposit Account Service`), so
+  `account` finds the class; queries with CamelCase terms also match via a subword
+  phrase. Consumers are unaffected (they re-fetch display data by `entity_id`).
+
+### Added
+- **`legacy-reverse --version`** (reads the installed package version).
+- **Tests** (`tests/test_search_tokenization.py`, `tests/test_cli.py`): Cyrillic
+  and mixed-language MATCH building, subword expansion (unit + FTS integration),
+  Russian `find_feature`/`find_code_areas` end-to-end, `--version` smoke.
+
 ## Unreleased — flat architecture JSON (import/export) + gigacode harness
 
 Goal: interoperate with the GigaCode `architecture-generator` and let it be the
