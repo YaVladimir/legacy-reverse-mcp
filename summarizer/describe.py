@@ -132,10 +132,16 @@ def imported_for_class(
     cache: sqlite3.Connection, fqn: str
 ) -> tuple[str | None, dict[str, str], str | None]:
     """Return (class_description_or_None, {canonical_signature: method_description},
-    stored_content_hash_or_None) for any imported descriptions of this class."""
+    stored_content_hash_or_None) for any imported descriptions of this class.
+
+    The freshness hash is taken from the *class* row deterministically (the method
+    rows share it at import time, but a partial re-import could leave them
+    disagreeing — picking an arbitrary row without ORDER BY made staleness a
+    coin-flip). Falls back to any method row's hash only when there's no class row."""
     class_text: str | None = None
     methods: dict[str, str] = {}
-    stored_hash: str | None = None
+    class_hash: str | None = None
+    any_hash: str | None = None
     prefix = f"{fqn}#"
     plen = len(prefix)
     for r in cache.execute(
@@ -145,10 +151,12 @@ def imported_for_class(
     ):
         if r["kind"] == "class" and r["ref_key"] == fqn:
             class_text = r["content"]
+            class_hash = r["content_hash"]
         elif r["kind"] == "method" and r["ref_key"].startswith(prefix):
             methods[r["ref_key"][plen:]] = r["content"]
-        if stored_hash is None and r["content_hash"]:
-            stored_hash = r["content_hash"]
+        if any_hash is None and r["content_hash"]:
+            any_hash = r["content_hash"]
+    stored_hash = class_hash if class_hash is not None else any_hash
     return class_text, methods, stored_hash
 
 
@@ -168,40 +176,59 @@ def reapply_imported(conn: sqlite3.Connection, repo_path: str | Path) -> dict:
     if not cache_path.exists():
         return stats
     repo_root = Path(repo_path).resolve()
-    cache = sqlite3.connect(cache_path)
-    cache.row_factory = sqlite3.Row
+    # _open_cache carries the schema migration (older caches lack content_hash); a
+    # raw connect + SELECT content_hash would raise mid-scan. A corrupt/non-sqlite
+    # file also raises here — a best-effort restore stage must never fail the scan,
+    # so degrade to a warning in stats and leave the (rebuildable) summaries empty.
     try:
-        # cache files created before imports existed have no imported_description
-        if not cache.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='imported_description'"
-        ).fetchone():
-            return stats
-        fqns = sorted({
-            r["ref_key"].split("#", 1)[0]
-            for r in cache.execute("SELECT ref_key FROM imported_description")
-        })
-        for fqn in fqns:
+        cache = _open_cache(repo_path)
+    except sqlite3.DatabaseError as exc:
+        stats["error"] = f"description cache unreadable, skipped restore: {exc}"
+        return stats
+    try:
+        # single pass over the imported rows, grouped by class fqn (was one indexed
+        # scan of the whole table per class — O(classes x rows)).
+        by_fqn: dict[str, dict] = {}
+        for r in cache.execute(
+            "SELECT ref_key, kind, content, content_hash FROM imported_description"
+        ):
+            fqn = r["ref_key"].split("#", 1)[0]
+            g = by_fqn.setdefault(
+                fqn, {"class_text": None, "class_hash": None, "methods": {}, "any_hash": None}
+            )
+            if r["kind"] == "class" and r["ref_key"] == fqn:
+                g["class_text"] = r["content"]
+                g["class_hash"] = r["content_hash"]
+            elif r["kind"] == "method" and r["ref_key"].startswith(f"{fqn}#"):
+                g["methods"][r["ref_key"][len(fqn) + 1:]] = r["content"]
+            if g["any_hash"] is None and r["content_hash"]:
+                g["any_hash"] = r["content_hash"]
+
+        for fqn, g in sorted(by_fqn.items()):
             row = conn.execute("SELECT id FROM class WHERE fqn = ?", (fqn,)).fetchone()
             if row is None:
                 stats["unmatched"] += 1
                 continue
-            class_text, methods, stored_hash = imported_for_class(cache, fqn)
+            # freshness judged by the class row's hash (see imported_for_class)
+            stored_hash = g["class_hash"] if g["class_hash"] is not None else g["any_hash"]
             skeleton = _class_skeleton(conn, row["id"])
             if stored_hash is not None and stored_hash != structure_hash(
                 skeleton, _source_snippet(skeleton, repo_root)
             ):
                 stats["stale"] += 1
                 continue
-            if class_text:
-                repo.set_class_summary(conn, row["id"], class_text, commit=False)
+            if g["class_text"]:
+                repo.set_class_summary(conn, row["id"], g["class_text"], commit=False)
                 stats["classes"] += 1
             sig_to_id = {m["signature"]: m["id"] for m in skeleton["methods"]}
-            for signature, text in methods.items():
+            for signature, text in g["methods"].items():
                 method_id = sig_to_id.get(signature)
                 if method_id is not None:
                     repo.set_method_summary(conn, method_id, text, commit=False)
                     stats["methods"] += 1
         conn.commit()
+    except sqlite3.DatabaseError as exc:
+        stats["error"] = f"description cache read failed, restore incomplete: {exc}"
     finally:
         cache.close()
     return stats

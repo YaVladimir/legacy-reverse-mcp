@@ -93,11 +93,13 @@ def build_index(conn, repo_path: str, progress=None, progress_every: int = 0) ->
 
     # a rebuilt index loses previously applied describe/import output; the durable
     # store (descriptions.sqlite3) survives, so restore what is still fresh before
-    # the FTS build picks summaries up. No LLM. Local import: keeps scanner free of
-    # a summarizer-LLM dependency at module load.
+    # the FTS build picks summaries up. No LLM. reapply_imported is best-effort and
+    # already degrades a broken cache to a warning in its stats, never raising.
     from summarizer.describe import reapply_imported
 
     restored = reapply_imported(conn, repo_path)
+    if restored.get("error"):
+        echo(f"  ! imported-description restore skipped: {restored['error']}")
     if restored["classes"] or restored["methods"]:
         msg = (
             f"Restored {restored['classes']} imported class / {restored['methods']} "
