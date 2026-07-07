@@ -65,7 +65,8 @@ def test_name_and_package_only_is_lower_confidence():
     # a service-named class in a service package, but NO stereotype annotation
     from index.repository import init_db
     from scanner.pipeline import build_index
-    import tempfile, pathlib
+    import tempfile
+    import pathlib
 
     root = pathlib.Path(tempfile.mkdtemp()) / "repo"
     src = root / "src/main/java/com/acme/service"

@@ -19,6 +19,7 @@ _DB_RELATIVE = Path(".reverse") / "index.sqlite3"
 
 
 @click.group()
+@click.version_option(package_name="legacy-reverse-mcp", prog_name="legacy-reverse")
 def cli() -> None:
     """legacy-reverse-mcp command-line interface."""
 
