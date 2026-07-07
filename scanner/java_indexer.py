@@ -64,7 +64,7 @@ def _resolve_module(rel_path: str, lookup: list[tuple[int, str]]) -> int | None:
 
 def _iter_java_files(repo_root: Path, skip_tests: bool):
     for dirpath, dirnames, filenames in os.walk(repo_root):
-        prune_dirnames(Path(dirpath), dirnames)
+        prune_dirnames(Path(dirpath), dirnames, repo_root)
         if skip_tests:
             parts = Path(dirpath).parts
             # skip standard test source roots: .../src/test/...
@@ -79,7 +79,7 @@ def _iter_java_files(repo_root: Path, skip_tests: bool):
                 # prune_dirnames only prunes subdirectories to recurse into; a stray
                 # .java file directly inside an otherwise-ignored dir (e.g. build/
                 # itself, not build/generated/) would still be yielded without this.
-                if not _is_ignored_path(candidate):
+                if not _is_ignored_path(candidate, repo_root):
                     yield candidate
 
 
