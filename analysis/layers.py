@@ -44,6 +44,14 @@ _PKG_LAYER: list[tuple[tuple[str, ...], str]] = [
     (("config",), "config"),
 ]
 
+# kinds that carry data, not behaviour: a record/enum/annotation is never a
+# Spring-managed bean (service/controller/repository/component) just because of
+# its name or package — e.g. a value ``record`` living in a ``*.service`` package
+# is a DTO, not "possibly a service".
+_DATA_CARRIER_KINDS = frozenset({"record", "enum", "annotation"})
+# layers that imply a runtime bean with behaviour
+_COMPONENT_LAYERS = frozenset({"controller", "service", "repository", "component"})
+
 
 def _first_fact(facts: list[dict], fact_type: str) -> dict | None:
     return next((f for f in facts if f["fact_type"] == fact_type), None)
@@ -106,6 +114,14 @@ def infer_spring_layer(
     if layer is None:
         nm = _name_layer(simple_name)
         pk = _pkg_layer(package)
+        # a data carrier (record/enum/annotation) is not a behavioural bean: drop
+        # any component-layer guess so a value record in a *.service package is not
+        # reported as "possibly a service" (a dto/util/entity guess still stands).
+        if kind in _DATA_CARRIER_KINDS:
+            if nm and nm[0] in _COMPONENT_LAYERS:
+                nm = None
+            if pk and pk[0] in _COMPONENT_LAYERS:
+                pk = None
         class_decl = _first_fact(class_facts, "class_declaration")
         pkg_decl = _first_fact(class_facts, "package_declaration")
         class_line = (class_decl["evidence"][0]["line_start"] if class_decl and class_decl["evidence"] else None)
@@ -155,6 +171,20 @@ def infer_spring_layer(
     return out
 
 
+def _endpoints_reattributed(conn, class_id: int) -> bool:
+    """True if the class owns endpoint rows and every one of them is superseded —
+    i.e. its mappings were reattributed to a concrete controller (the openapi
+    ``*Api`` contract interfaces). Such a class is a resolved contract, not an
+    unclassified controller."""
+    try:
+        rows = conn.execute(
+            "SELECT superseded FROM endpoint WHERE controller_class_id = ?", (class_id,)
+        ).fetchall()
+    except Exception:  # noqa: BLE001 - old DB without the superseded column: no signal
+        return False
+    return bool(rows) and all(r["superseded"] for r in rows)
+
+
 def compute_low_confidence_findings(conn, limit: int = 25) -> list[InferredFinding]:
     """Classes with no stereotype (role 'unknown') but a name/package layer hint.
 
@@ -164,7 +194,7 @@ def compute_low_confidence_findings(conn, limit: int = 25) -> list[InferredFindi
     """
     out: list[InferredFinding] = []
     for r in conn.execute(
-        "SELECT cl.fqn, cl.simple_name, cl.file_path, p.fqn AS pkg "
+        "SELECT cl.id, cl.fqn, cl.simple_name, cl.kind, cl.file_path, p.fqn AS pkg "
         "FROM class cl LEFT JOIN package p ON p.id = cl.package_id "
         "WHERE cl.role = 'unknown' ORDER BY cl.fqn"
     ):
@@ -173,6 +203,15 @@ def compute_low_confidence_findings(conn, limit: int = 25) -> list[InferredFindi
         if not (nm or pk):
             continue
         layer = (nm or pk)[0]
+        # B3: a data carrier (record/enum/annotation) is never a behavioural bean —
+        # don't guess a component layer for it (kills "value record -> possibly a service").
+        if r["kind"] in _DATA_CARRIER_KINDS and layer in _COMPONENT_LAYERS:
+            continue
+        # B4: a contract interface whose endpoints were all reattributed to a concrete
+        # controller is already resolved — don't re-surface it as "possibly a controller"
+        # (the openapi-generated *Api interfaces).
+        if layer == "controller" and _endpoints_reattributed(conn, r["id"]):
+            continue
         reason = f"name '{r['simple_name']}' suggests {nm[0]}" if nm else f"package suggests {pk[0]}"
         out.append(
             InferredFinding(
