@@ -39,6 +39,9 @@ from index.search import build_search_index
 from summarizer import describe
 
 _GENERIC = re.compile(r"<[^<>]*>")
+_MODIFIERS = frozenset(
+    ("public", "private", "protected", "static", "final", "abstract", "synchronized")
+)
 
 
 # ------------------------------------------------------------
@@ -114,19 +117,30 @@ def _simple_type(t: str | None) -> str:
 
 
 def _name_and_params(sig: str) -> tuple[str, list[str]]:
-    """('createDeposit', ['DepositRequest']) from 'createDeposit(DepositRequest req): Deposit'."""
+    """('createDeposit', ['DepositRequest']) from 'createDeposit(DepositRequest req): Deposit'.
+
+    A foreign ``sig`` may carry leading Java modifiers and a return type before the
+    name (``public static void main(String[] args)``): the method name is the last
+    token before ``(`` that isn't a modifier, not the whole prefix. Our own export /
+    index stores a clean ``name(types): ret`` form, so this only bites when consuming
+    an externally produced arch.json — but there a naive prefix grab would mis-name
+    the method and drop its description on the floor."""
     if "(" not in sig:
         return sig.strip(), []
-    name = sig[: sig.index("(")].strip()
+    before_paren = sig[: sig.index("(")].strip()
+    tokens = before_paren.split()
+    name = tokens[-1] if tokens else before_paren  # last token = name (return type precedes it)
+    if name.lower() in _MODIFIERS and len(tokens) > 1:
+        name = tokens[-2]
     inner = sig[sig.index("(") + 1 : sig.rfind(")")] if ")" in sig else sig[sig.index("(") + 1 :]
     inner = _GENERIC.sub("", inner).strip()
     if not inner:
         return name, []
     params: list[str] = []
     for raw in inner.split(","):
-        tokens = raw.strip().split()
+        parts = raw.strip().split()
         # 'Type name' -> Type (drop trailing identifier); 'Type' -> Type
-        type_str = " ".join(tokens[:-1]) if len(tokens) >= 2 else (tokens[0] if tokens else "")
+        type_str = " ".join(parts[:-1]) if len(parts) >= 2 else (parts[0] if parts else "")
         params.append(_simple_type(type_str))
     return name, params
 
