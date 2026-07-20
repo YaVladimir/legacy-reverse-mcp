@@ -137,6 +137,21 @@ def test_derive_cbmc_project_name_mirrors_binary_rules(tmp_path):
     assert name.endswith("myrepo")
 
 
+def test_cbmc_name_map_posix_windows_and_nonascii():
+    """Cross-platform shapes, pinned OS-independently (the resolve() step would graft
+    a drive onto a POSIX path on Windows, so the pure mapping is tested directly).
+    The POSIX expectation matches the binary's own docs: "/tmp/bench/..." → "tmp-bench-..."."""
+    # POSIX: leading '/' becomes a leading dash and is trimmed
+    assert bg._cbmc_name_map("/home/user/myrepo") == "home-user-myrepo"
+    assert bg._cbmc_name_map("/tmp/bench") == "tmp-bench"
+    # Windows: drive colon + separator collapse into a single dash
+    assert bg._cbmc_name_map("D:/dev/legacy") == "D-dev-legacy"
+    # non-ASCII bytes → two lowercase hex digits each (fqn.c #571)
+    assert bg._cbmc_name_map("/tmp/пример") == "tmp-d0bfd180d0b8d0bcd0b5d180"
+    # spaces are unsafe too (fqn.c #349: "my project" must not keep the space)
+    assert bg._cbmc_name_map("/home/u/my project") == "home-u-my-project"
+
+
 def test_resolve_project_refuses_ambiguous(monkeypatch, tmp_path, capsys):
     repo = tmp_path / "svc"
     repo.mkdir()

@@ -153,17 +153,17 @@ def _cls_fqn(cls: dict) -> str:
     return f"{pkg}.{name}" if pkg and name else name
 
 
-def _derive_cbmc_project_name(repo_path: str | Path) -> str:
-    """Mirror CBMC's own path→project-name derivation (fqn.c:cbm_project_name_from_path):
-    every byte outside [A-Za-z0-9._-] maps to '-' (so ':' and both path separators go),
+def _cbmc_name_map(posix_path: str) -> str:
+    """Pure mapping half of CBMC's path→project-name derivation
+    (fqn.c:cbm_project_name_from_path, everything after realpath): every byte
+    outside [A-Za-z0-9._-] maps to '-' (so ':' and both path separators go),
     non-ASCII bytes become two lowercase hex digits, consecutive '-'/'.' collapse,
-    leading '-'/'.' and trailing '-' are trimmed. A naive ``path.replace("/", "-")``
-    keeps the drive colon on Windows and a leading dash on POSIX — the exact-match
-    step would then never fire and resolution would always fall to the fuzzier
-    substring heuristic."""
-    raw = Path(repo_path).resolve().as_posix().encode("utf-8")
+    leading '-'/'.' and trailing '-' are trimmed. Split from the resolve() step so
+    the POSIX shape (leading '/' → trimmed leading dash: "/tmp/bench" →
+    "tmp-bench") stays testable on Windows, where resolve() would graft a drive
+    onto a POSIX-style path."""
     out: list[str] = []
-    for b in raw:
+    for b in posix_path.encode("utf-8"):
         c = chr(b)
         if c.isascii() and (c.isalnum() or c in "._-"):
             out.append(c)
@@ -177,6 +177,14 @@ def _derive_cbmc_project_name(repo_path: str | Path) -> str:
             s = s.replace(pair, single)
     s = s.lstrip("-.").rstrip("-")
     return s or "root"
+
+
+def _derive_cbmc_project_name(repo_path: str | Path) -> str:
+    """Mirror CBMC's own path→project-name derivation. A naive
+    ``path.replace("/", "-")`` keeps the drive colon on Windows and a leading dash
+    on POSIX — the exact-match step would then never fire and resolution would
+    always fall to the fuzzier substring heuristic."""
+    return _cbmc_name_map(Path(repo_path).resolve().as_posix())
 
 
 def _resolve_cbmc_project(
