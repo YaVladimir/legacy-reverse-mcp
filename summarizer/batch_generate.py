@@ -55,6 +55,10 @@ _DEFAULT_PARALLEL = 5
 _DEFAULT_TIMEOUT = 900
 _DEFAULT_CBMC_TIMEOUT = 30.0
 _CBMC_FETCH_PARALLEL = 8   # per-chunk code-snippet fetches; independent of --parallel
+# --parallel chunk workers × _CBMC_FETCH_PARALLEL fetch threads would otherwise spawn
+# up to 40 binary processes at once (each CLI call is a full process start); this
+# caps process-level concurrency across all chunks.
+_CBMC_CALL_SEM = threading.BoundedSemaphore(16)
 
 
 # ---------------------------------------------------------------------------
@@ -161,7 +165,12 @@ def _cbmc_name_map(posix_path: str) -> str:
     leading '-'/'.' and trailing '-' are trimmed. Split from the resolve() step so
     the POSIX shape (leading '/' → trimmed leading dash: "/tmp/bench" →
     "tmp-bench") stays testable on Windows, where resolve() would graft a drive
-    onto a POSIX-style path."""
+    onto a POSIX-style path.
+
+    Pinned against the fqn.c shipped with codebase-memory-mcp as of 2026-07 (PR #9).
+    If the binary's algorithm drifts on an upgrade, the exact-match resolution step
+    silently stops firing and everything falls to the substring heuristic — re-verify
+    this mapping (and its tests) when bumping the binary."""
     out: list[str] = []
     for b in posix_path.encode("utf-8"):
         c = chr(b)
@@ -226,6 +235,29 @@ def _resolve_cbmc_project(
     return None
 
 
+def _setup_cbmc(args: argparse.Namespace, repo_path: Path) -> tuple[bool, str | None, str | None]:
+    """Resolve the CBMC binary + project for ``--use-cbmc``; (enabled, binary, project).
+
+    The toml config is loaded even when ``--cbmc-bin`` overrides the binary — an
+    explicit binary must not silently discard ``[cbmc] project`` pinning (losing it
+    would drop project resolution to the fuzzier substring heuristic). Any gap
+    (binary unavailable, project unresolvable) disables grounding with a message
+    rather than guessing."""
+    if not args.use_cbmc:
+        return False, None, None
+    resolved_bin, cbmc_cfg = resolve_cbmc_config(str(repo_path))
+    cbmc_binary = args.cbmc_bin or resolved_bin
+    if not cbmc_available(cbmc_binary):
+        print(f"--use-cbmc: '{cbmc_binary}' unavailable — falling back to file mode")
+        return False, None, None
+    cbmc_project = _resolve_cbmc_project(str(repo_path), cbmc_cfg, binary=cbmc_binary)
+    if not cbmc_project:
+        print("--use-cbmc: could not resolve a CBMC project — falling back to file mode")
+        return False, cbmc_binary, None
+    print(f"CBMC grounding enabled: binary={cbmc_binary}, project={cbmc_project}")
+    return True, cbmc_binary, cbmc_project
+
+
 def _extract_snippet(result: dict) -> tuple[str, list[str]]:
     """(source, related_names) from a get_code_snippet result.
 
@@ -252,42 +284,56 @@ def _fetch_class_code(
     if not fqn:
         return None
 
-    result, _info = cbmc_get_code_snippet(
-        fqn, project=project, include_neighbors=True, binary=binary, timeout=cbmc_timeout
-    )
-    if result:
-        src, related = _extract_snippet(result)
-        if src:
-            return {"fqn": fqn, "code": src, "related": related}
-
-    # fallback: arch.json name may differ from the graph's canonical qualified_name.
-    # name_pattern + label=Class (exact-name regex, server-side label filter) beats a
-    # BM25 `query` here: BM25 camelCase-splits the name and boosts Functions/Routes,
-    # so the top hit for "OrderService" could be a method — not the class itself.
-    name = cls.get("name", "")
-    sres, _ = (
-        cbmc_call(
-            "search_graph",
-            {"project": project, "name_pattern": f"^{re.escape(name)}$", "label": "Class",
-             "limit": 5},
-            binary=binary,
+    with _CBMC_CALL_SEM:
+        result, _info = cbmc_get_code_snippet(
+            fqn, project=project, include_neighbors=True, binary=binary, timeout=cbmc_timeout
         )
-        if name else (None, {})
-    )
-    matches = (sres or {}).get("results") or []
-    qn = next(
-        (m.get("qualified_name", "") for m in matches
-         if isinstance(m, dict) and m.get("qualified_name")),
-        "",
-    )
-    if qn and qn != fqn:
-        result2, _ = cbmc_get_code_snippet(
-            qn, project=project, include_neighbors=True, binary=binary, timeout=cbmc_timeout
-        )
-        if result2:
-            src, related = _extract_snippet(result2)
+        if result:
+            src, related = _extract_snippet(result)
             if src:
                 return {"fqn": fqn, "code": src, "related": related}
+
+        # fallback: arch.json name may differ from the graph's canonical qualified_name.
+        # name_pattern + label=Class (exact-name regex, server-side label filter) beats a
+        # BM25 `query` here: BM25 camelCase-splits the name and boosts Functions/Routes,
+        # so the top hit for "OrderService" could be a method — not the class itself.
+        name = cls.get("name", "")
+        sres, _ = (
+            cbmc_call(
+                "search_graph",
+                {"project": project, "name_pattern": f"^{re.escape(name)}$", "label": "Class",
+                 "limit": 5},
+                binary=binary, timeout=cbmc_timeout,
+            )
+            if name else (None, {})
+        )
+        matches = (sres or {}).get("results") or []
+        qns = list(dict.fromkeys(
+            m["qualified_name"] for m in matches
+            if isinstance(m, dict) and m.get("qualified_name")
+        ))
+        # A simple-name hit may be a same-named class from another package. The
+        # canonical QN may carry a project/source-root prefix, but it must still end
+        # with OUR package-qualified name — otherwise this class would be grounded
+        # in foreign code. Without a pkg we can only trust a unique match.
+        pkg = cls.get("pkg", "")
+        if pkg:
+            want = f"{pkg}.{name}".lower()
+            qns = [q for q in qns
+                   if (norm := q.replace("/", ".").lower()) == want
+                   or norm.endswith("." + want)]
+        if len(qns) > 1:
+            print(f"  CBMC: ambiguous graph match for {fqn}: {qns} — describing from signature")
+            return None
+        qn = qns[0] if qns else ""
+        if qn and qn != fqn:
+            result2, _ = cbmc_get_code_snippet(
+                qn, project=project, include_neighbors=True, binary=binary, timeout=cbmc_timeout
+            )
+            if result2:
+                src, related = _extract_snippet(result2)
+                if src:
+                    return {"fqn": fqn, "code": src, "related": related}
     return None
 
 
@@ -448,6 +494,33 @@ def _validate_chunk_result(
 # per-chunk runner (used by ThreadPoolExecutor)
 # ---------------------------------------------------------------------------
 
+def _build_prompt_for_chunk(
+    chunk_path: Path,
+    chunk_idx: int,
+    total_chunks: int,
+    chunk_classes: list[dict] | None,
+    *,
+    use_cbmc: bool,
+    cbmc_project: str | None,
+    cbmc_binary: str | None,
+    cbmc_timeout: float,
+) -> tuple[str, int | None]:
+    """(prompt, grounded_count) for one chunk.
+
+    With ``use_cbmc`` and a resolved project, the prompt inlines each class's real
+    source pulled from CBMC (Layer 1). Grounding is per-class: whatever CBMC can't
+    resolve degrades to its signature *within the same enriched prompt* — we don't
+    throw away a chunk's worth of grounded code just because one class was missing.
+    Only a total miss (nothing grounded) reverts the chunk to the file-based prompt.
+    ``grounded_count`` is None when CBMC wasn't in play at all (pure file mode)."""
+    if use_cbmc and cbmc_project and chunk_classes:
+        ctx = _fetch_chunk_context(chunk_classes, cbmc_project, cbmc_binary, cbmc_timeout)
+        if ctx:
+            return _cbmc_chunk_prompt(chunk_classes, chunk_idx, total_chunks, ctx), len(ctx)
+        return _chunk_prompt(chunk_path, chunk_idx, total_chunks), 0
+    return _chunk_prompt(chunk_path, chunk_idx, total_chunks), None
+
+
 def _run_single_chunk(
     chunk_path: Path,
     chunk_idx: int,
@@ -463,23 +536,12 @@ def _run_single_chunk(
     cbmc_timeout: float = _DEFAULT_CBMC_TIMEOUT,
     chunk_classes: list[dict] | None = None,
 ) -> tuple[int, dict | None, dict]:
-    """Shell out to GigaCode for one chunk; return (chunk_idx, parsed_or_None, info).
-
-    With ``use_cbmc`` and a resolved project, the prompt inlines each class's real
-    source pulled from CBMC (Layer 1). Grounding is per-class: whatever CBMC can't
-    resolve degrades to its signature *within the same enriched prompt* — we don't
-    throw away a chunk's worth of grounded code just because one class was missing.
-    Only a total miss (nothing grounded) reverts the chunk to the file-based prompt."""
-    grounded: int | None = None
-    if use_cbmc and cbmc_project and chunk_classes:
-        ctx = _fetch_chunk_context(chunk_classes, cbmc_project, cbmc_binary, cbmc_timeout)
-        grounded = len(ctx)
-        if ctx:
-            prompt = _cbmc_chunk_prompt(chunk_classes, chunk_idx, total_chunks, ctx)
-        else:
-            prompt = _chunk_prompt(chunk_path, chunk_idx, total_chunks)
-    else:
-        prompt = _chunk_prompt(chunk_path, chunk_idx, total_chunks)
+    """Shell out to GigaCode for one chunk; return (chunk_idx, parsed_or_None, info)."""
+    prompt, grounded = _build_prompt_for_chunk(
+        chunk_path, chunk_idx, total_chunks, chunk_classes,
+        use_cbmc=use_cbmc, cbmc_project=cbmc_project,
+        cbmc_binary=cbmc_binary, cbmc_timeout=cbmc_timeout,
+    )
     config = HarnessConfig(
         cmd=gigacode_cmd, args=gigacode_args, prompt=prompt,
         output="stdout", timeout=timeout, cwd=cwd,
@@ -659,21 +721,7 @@ def main(argv: list[str] | None = None) -> None:  # noqa: C901 - linear orchestr
     gigacode_args = raw_args.split()
 
     # 4b. codebase-memory-mcp (Layer-1 grounding) — resolve once, degrade cleanly ----
-    use_cbmc = args.use_cbmc
-    cbmc_binary: str | None = None
-    cbmc_project: str | None = None
-    if use_cbmc:
-        cbmc_binary, cbmc_cfg = (args.cbmc_bin, {}) if args.cbmc_bin else resolve_cbmc_config(str(repo_path))
-        if not cbmc_available(cbmc_binary):
-            print(f"--use-cbmc: '{cbmc_binary}' unavailable — falling back to file mode")
-            use_cbmc = False
-        else:
-            cbmc_project = _resolve_cbmc_project(str(repo_path), cbmc_cfg, binary=cbmc_binary)
-            if not cbmc_project:
-                print("--use-cbmc: could not resolve a CBMC project — falling back to file mode")
-                use_cbmc = False
-            else:
-                print(f"CBMC grounding enabled: binary={cbmc_binary}, project={cbmc_project}")
+    use_cbmc, cbmc_binary, cbmc_project = _setup_cbmc(args, repo_path)
 
     # 5/6. produce raw results: run GigaCode, or pick up outputs from disk ----
     project_name = original.get("project", "unknown")

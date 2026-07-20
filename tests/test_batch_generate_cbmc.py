@@ -9,6 +9,9 @@ logged, not silently swallowed, and simply drops that class from the context."""
 
 from __future__ import annotations
 
+import argparse
+from pathlib import Path
+
 import summarizer.batch_generate as bg
 
 _CLASSES = [
@@ -84,7 +87,7 @@ def test_fetch_class_code_falls_back_to_class_label_search(monkeypatch):
         return _snippet("SRC2"), {}
 
     def fake_call(tool, args, binary=None, timeout=300.0, repo_path=None):
-        calls["tool"], calls["args"] = tool, args
+        calls["tool"], calls["args"], calls["timeout"] = tool, args, timeout
         return {"results": [{"qualified_name": "proj.src.com.example.app.OrderService",
                              "label": "Class"}]}, {}
 
@@ -95,6 +98,43 @@ def test_fetch_class_code_falls_back_to_class_label_search(monkeypatch):
     assert calls["tool"] == "search_graph"
     assert calls["args"]["label"] == "Class"
     assert calls["args"]["name_pattern"] == "^OrderService$"
+    # --cbmc-timeout must govern the fallback search too, not the 300s default
+    assert calls["timeout"] == 30.0
+
+
+def test_fetch_class_code_fallback_filters_foreign_package(monkeypatch):
+    """Two same-named classes in different packages: the wrong-package hit must be
+    filtered out by the pkg-suffix check — grounding a class in a same-named foreign
+    class's code is worse than describing from the signature."""
+    def fake_snippet(qn, project=None, include_neighbors=True, binary=None, timeout=30.0):
+        if qn == "com.example.app.OrderService":
+            return None, {"error": "not found"}
+        assert qn == "proj.src.com.example.app.OrderService"  # never the foreign one
+        return _snippet("RIGHT"), {}
+
+    def fake_call(tool, args, binary=None, timeout=300.0, repo_path=None):
+        return {"results": [
+            {"qualified_name": "proj.src.com.other.legacy.OrderService", "label": "Class"},
+            {"qualified_name": "proj.src.com.example.app.OrderService", "label": "Class"},
+        ]}, {}
+
+    monkeypatch.setattr(bg, "cbmc_get_code_snippet", fake_snippet)
+    monkeypatch.setattr(bg, "cbmc_call", fake_call)
+    res = bg._fetch_class_code(_CLASSES[0], "proj", None, 30.0)
+    assert res and res["code"] == "RIGHT"
+
+
+def test_fetch_class_code_fallback_refuses_ambiguity_without_pkg(monkeypatch, capsys):
+    """No pkg to filter on and several same-named candidates: refuse (degrade to the
+    signature) rather than ground with the first hit."""
+    cls = {"id": "src/C", "name": "OrderService", "sig": "class OrderService"}
+    monkeypatch.setattr(bg, "cbmc_get_code_snippet",
+                        lambda *a, **k: (None, {"error": "not found"}))
+    monkeypatch.setattr(bg, "cbmc_call", lambda *a, **k: ({"results": [
+        {"qualified_name": "p.a.OrderService"}, {"qualified_name": "p.b.OrderService"},
+    ]}, {}))
+    assert bg._fetch_class_code(cls, "proj", None, 30.0) is None
+    assert "ambiguous graph match" in capsys.readouterr().out
 
 
 def test_fetch_chunk_context_logs_failure_not_swallow(monkeypatch, capsys):
@@ -178,3 +218,73 @@ def test_resolve_project_passes_explicit_binary(monkeypatch, tmp_path):
     monkeypatch.setattr(bg, "cbmc_list_projects", fake_list)
     assert bg._resolve_cbmc_project(str(repo), binary="/opt/custom/cbmc") is not None
     assert seen["binary"] == "/opt/custom/cbmc"
+
+
+def test_resolve_project_env_var_wins(monkeypatch):
+    monkeypatch.setenv("LEGACY_REVERSE_CBMC_PROJECT", "env-proj")
+    monkeypatch.setattr(bg, "cbmc_list_projects",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not list")))
+    assert bg._resolve_cbmc_project("/repo/x") == "env-proj"
+
+
+# --- _setup_cbmc: --cbmc-bin must not lose toml project pinning --------------
+
+def test_setup_cbmc_explicit_bin_keeps_toml_project(monkeypatch):
+    """--cbmc-bin overrides the binary but must NOT discard the toml [cbmc] project —
+    losing it silently drops project resolution to the substring heuristic (the old
+    code passed an empty config dict whenever --cbmc-bin was given)."""
+    monkeypatch.delenv("LEGACY_REVERSE_CBMC_PROJECT", raising=False)
+    monkeypatch.setattr(bg, "resolve_cbmc_config",
+                        lambda repo: ("/resolved/bin", {"project": "pinned-proj"}))
+    monkeypatch.setattr(bg, "cbmc_available", lambda b: True)
+    monkeypatch.setattr(bg, "cbmc_list_projects",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not list")))
+    args = argparse.Namespace(use_cbmc=True, cbmc_bin="/custom/bin")
+    assert bg._setup_cbmc(args, Path("/repo")) == (True, "/custom/bin", "pinned-proj")
+
+
+def test_setup_cbmc_disabled_without_flag():
+    args = argparse.Namespace(use_cbmc=False, cbmc_bin=None)
+    assert bg._setup_cbmc(args, Path("/repo")) == (False, None, None)
+
+
+def test_setup_cbmc_unavailable_binary_degrades(monkeypatch, capsys):
+    monkeypatch.setattr(bg, "resolve_cbmc_config", lambda repo: ("/gone/bin", {}))
+    monkeypatch.setattr(bg, "cbmc_available", lambda b: False)
+    args = argparse.Namespace(use_cbmc=True, cbmc_bin=None)
+    assert bg._setup_cbmc(args, Path("/repo")) == (False, None, None)
+    assert "falling back to file mode" in capsys.readouterr().out
+
+
+# --- _build_prompt_for_chunk: CBMC / file-mode wiring ------------------------
+
+def test_build_prompt_grounded_uses_cbmc_prompt(monkeypatch, tmp_path):
+    ctx = {"com.example.app.OrderService": {"code": "SRC", "related": []}}
+    monkeypatch.setattr(bg, "_fetch_chunk_context", lambda *a, **k: ctx)
+    prompt, grounded = bg._build_prompt_for_chunk(
+        tmp_path / "chunk-0000.json", 0, 1, _CLASSES,
+        use_cbmc=True, cbmc_project="proj", cbmc_binary=None, cbmc_timeout=30.0,
+    )
+    assert grounded == 1
+    assert "[Код из knowledge graph]" in prompt
+
+
+def test_build_prompt_total_miss_reverts_to_file_mode(monkeypatch, tmp_path):
+    """Nothing grounded at all → the chunk falls back to the file-based prompt
+    (grounded == 0 so the summary still counts it as a CBMC attempt)."""
+    monkeypatch.setattr(bg, "_fetch_chunk_context", lambda *a, **k: {})
+    prompt, grounded = bg._build_prompt_for_chunk(
+        tmp_path / "chunk-0000.json", 0, 1, _CLASSES,
+        use_cbmc=True, cbmc_project="proj", cbmc_binary=None, cbmc_timeout=30.0,
+    )
+    assert grounded == 0
+    assert "Открой файл" in prompt
+
+
+def test_build_prompt_file_mode_without_cbmc(tmp_path):
+    prompt, grounded = bg._build_prompt_for_chunk(
+        tmp_path / "chunk-0000.json", 0, 1, _CLASSES,
+        use_cbmc=False, cbmc_project=None, cbmc_binary=None, cbmc_timeout=30.0,
+    )
+    assert grounded is None  # CBMC wasn't in play at all
+    assert "Открой файл" in prompt
