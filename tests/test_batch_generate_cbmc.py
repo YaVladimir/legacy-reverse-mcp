@@ -18,8 +18,9 @@ _CLASSES = [
 ]
 
 
-def _snippet(source, neighbors=()):
-    return {"source": source, "neighbors": [{"qualified_name": n} for n in neighbors]}
+def _snippet(source, callers=(), callees=()):
+    # real binary response shape: caller_names/callee_names are plain string arrays
+    return {"source": source, "caller_names": list(callers), "callee_names": list(callees)}
 
 
 # --- prompt: grounded inline + per-class signature degradation ---------------
@@ -60,12 +61,40 @@ def test_cbmc_prompt_caps_oversized_source():
 def test_fetch_class_code_grounds_by_fqn(monkeypatch):
     def fake_snippet(qn, project=None, include_neighbors=True, binary=None, timeout=30.0):
         assert qn == "com.example.app.OrderService"
-        return _snippet("SRC", ["com.example.app.OrderRepository"]), {}
+        return _snippet("SRC", callers=["com.example.app.OrderController"],
+                        callees=["com.example.app.OrderRepository"]), {}
 
     monkeypatch.setattr(bg, "cbmc_get_code_snippet", fake_snippet)
     res = bg._fetch_class_code(_CLASSES[0], "proj", None, 30.0)
     assert res == {"fqn": "com.example.app.OrderService", "code": "SRC",
-                   "related": ["com.example.app.OrderRepository"]}
+                   "related": ["com.example.app.OrderController",
+                               "com.example.app.OrderRepository"]}
+
+
+def test_fetch_class_code_falls_back_to_class_label_search(monkeypatch):
+    """When the FQN doesn't resolve, the fallback must search with name_pattern +
+    label=Class (exact regex, server-side filter) — a BM25 query would camelCase-split
+    the name and could surface a method/route as the top hit."""
+    calls = {}
+
+    def fake_snippet(qn, project=None, include_neighbors=True, binary=None, timeout=30.0):
+        if qn == "com.example.app.OrderService":
+            return None, {"error": "not found"}
+        assert qn == "proj.src.com.example.app.OrderService"  # canonical graph QN
+        return _snippet("SRC2"), {}
+
+    def fake_call(tool, args, binary=None, timeout=300.0, repo_path=None):
+        calls["tool"], calls["args"] = tool, args
+        return {"results": [{"qualified_name": "proj.src.com.example.app.OrderService",
+                             "label": "Class"}]}, {}
+
+    monkeypatch.setattr(bg, "cbmc_get_code_snippet", fake_snippet)
+    monkeypatch.setattr(bg, "cbmc_call", fake_call)
+    res = bg._fetch_class_code(_CLASSES[0], "proj", None, 30.0)
+    assert res and res["code"] == "SRC2"
+    assert calls["tool"] == "search_graph"
+    assert calls["args"]["label"] == "Class"
+    assert calls["args"]["name_pattern"] == "^OrderService$"
 
 
 def test_fetch_chunk_context_logs_failure_not_swallow(monkeypatch, capsys):
@@ -92,9 +121,20 @@ def test_resolve_project_prefers_explicit_config(monkeypatch):
 def test_resolve_project_exact_path_match(monkeypatch, tmp_path):
     repo = tmp_path / "myrepo"
     repo.mkdir()
-    expected = repo.resolve().as_posix().replace("/", "-")
+    expected = bg._derive_cbmc_project_name(repo)
     monkeypatch.setattr(bg, "cbmc_list_projects", lambda *a, **k: ([{"name": expected}], {}))
     assert bg._resolve_cbmc_project(str(repo)) == expected
+
+
+def test_derive_cbmc_project_name_mirrors_binary_rules(tmp_path):
+    """Mirror of fqn.c:cbm_project_name_from_path: unsafe chars (':' '/' '\\') → '-',
+    dashes collapse, leading dash trimmed. The naive replace('/', '-') kept the drive
+    colon on Windows and a leading dash on POSIX — exact match then never fired."""
+    name = bg._derive_cbmc_project_name(tmp_path / "myrepo")
+    assert ":" not in name and "/" not in name and "\\" not in name
+    assert not name.startswith(("-", "."))
+    assert "--" not in name
+    assert name.endswith("myrepo")
 
 
 def test_resolve_project_refuses_ambiguous(monkeypatch, tmp_path, capsys):

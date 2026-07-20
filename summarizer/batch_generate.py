@@ -44,9 +44,9 @@ from index.repository import get_conn
 from summarizer.harness import HarnessConfig, _build_argv, _extract_json, gigacode_available
 from utils.cbmc_config import (
     cbmc_available,
+    cbmc_call,
     cbmc_get_code_snippet,
     cbmc_list_projects,
-    cbmc_search_graph,
     resolve_cbmc_config,
 )
 
@@ -153,6 +153,32 @@ def _cls_fqn(cls: dict) -> str:
     return f"{pkg}.{name}" if pkg and name else name
 
 
+def _derive_cbmc_project_name(repo_path: str | Path) -> str:
+    """Mirror CBMC's own path→project-name derivation (fqn.c:cbm_project_name_from_path):
+    every byte outside [A-Za-z0-9._-] maps to '-' (so ':' and both path separators go),
+    non-ASCII bytes become two lowercase hex digits, consecutive '-'/'.' collapse,
+    leading '-'/'.' and trailing '-' are trimmed. A naive ``path.replace("/", "-")``
+    keeps the drive colon on Windows and a leading dash on POSIX — the exact-match
+    step would then never fire and resolution would always fall to the fuzzier
+    substring heuristic."""
+    raw = Path(repo_path).resolve().as_posix().encode("utf-8")
+    out: list[str] = []
+    for b in raw:
+        c = chr(b)
+        if c.isascii() and (c.isalnum() or c in "._-"):
+            out.append(c)
+        elif b >= 0x80:
+            out.append(f"{b:02x}")
+        else:
+            out.append("-")
+    s = "".join(out)
+    for pair, single in (("--", "-"), ("..", ".")):
+        while pair in s:
+            s = s.replace(pair, single)
+    s = s.lstrip("-.").rstrip("-")
+    return s or "root"
+
+
 def _resolve_cbmc_project(
     repo_path: str, config: dict | None = None, binary: str | None = None
 ) -> str | None:
@@ -176,8 +202,8 @@ def _resolve_cbmc_project(
         return None
 
     repo = Path(repo_path).resolve()
-    # 2. exact path-based name (CBMC default: path with separators replaced by '-')
-    expected = repo.as_posix().replace("/", "-")
+    # 2. exact derived name (CBMC's own path→name algorithm)
+    expected = _derive_cbmc_project_name(repo)
     if expected in names:
         return expected
 
@@ -193,11 +219,18 @@ def _resolve_cbmc_project(
 
 
 def _extract_snippet(result: dict) -> tuple[str, list[str]]:
-    """(source, related_qualified_names) from a get_code_snippet result."""
+    """(source, related_names) from a get_code_snippet result.
+
+    With include_neighbors the binary returns ``caller_names`` + ``callee_names``
+    (plain string arrays) — there is no ``neighbors`` field in its response (the
+    original fork draft read one and always got an empty list, silently dropping
+    the related-classes context from every prompt)."""
     src = (result.get("source") or "").strip()
-    neighbors = result.get("neighbors") or []
-    related = [n.get("qualified_name", "") for n in neighbors[:5] if n.get("qualified_name")]
-    return src, related
+    related = [
+        n for n in (result.get("caller_names") or []) + (result.get("callee_names") or [])
+        if isinstance(n, str) and n
+    ]
+    return src, related[:5]
 
 
 def _fetch_class_code(
@@ -219,10 +252,21 @@ def _fetch_class_code(
         if src:
             return {"fqn": fqn, "code": src, "related": related}
 
-    # fallback: arch.json name may differ from the graph's canonical qualified_name
+    # fallback: arch.json name may differ from the graph's canonical qualified_name.
+    # name_pattern + label=Class (exact-name regex, server-side label filter) beats a
+    # BM25 `query` here: BM25 camelCase-splits the name and boosts Functions/Routes,
+    # so the top hit for "OrderService" could be a method — not the class itself.
     name = cls.get("name", "")
-    sres, _ = cbmc_search_graph(name, project=project, binary=binary) if name else (None, {})
-    matches = (sres or {}).get("results") or (sres or {}).get("matches") or []
+    sres, _ = (
+        cbmc_call(
+            "search_graph",
+            {"project": project, "name_pattern": f"^{re.escape(name)}$", "label": "Class",
+             "limit": 5},
+            binary=binary,
+        )
+        if name else (None, {})
+    )
+    matches = (sres or {}).get("results") or []
     qn = next(
         (m.get("qualified_name", "") for m in matches
          if isinstance(m, dict) and m.get("qualified_name")),
