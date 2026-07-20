@@ -59,6 +59,7 @@ _CBMC_FETCH_PARALLEL = 8   # per-chunk code-snippet fetches; independent of --pa
 # up to 40 binary processes at once (each CLI call is a full process start); this
 # caps process-level concurrency across all chunks.
 _CBMC_CALL_SEM = threading.BoundedSemaphore(16)
+_CBMC_PROJECT_NAME_MAX = 200  # fqn.c:FQN_MAX_NAME_LEN
 
 
 # ---------------------------------------------------------------------------
@@ -162,15 +163,16 @@ def _cbmc_name_map(posix_path: str) -> str:
     (fqn.c:cbm_project_name_from_path, everything after realpath): every byte
     outside [A-Za-z0-9._-] maps to '-' (so ':' and both path separators go),
     non-ASCII bytes become two lowercase hex digits, consecutive '-'/'.' collapse,
-    leading '-'/'.' and trailing '-' are trimmed. Split from the resolve() step so
+    leading '-'/'.' and trailing '-' are trimmed. Names longer than 200 bytes keep
+    a 191-byte prefix plus an FNV-1a hash, matching ``fqn_bound_name_len``. Split
+    from the resolve() step so
     the POSIX shape (leading '/' → trimmed leading dash: "/tmp/bench" →
     "tmp-bench") stays testable on Windows, where resolve() would graft a drive
     onto a POSIX-style path.
 
     Pinned against the fqn.c shipped with codebase-memory-mcp as of 2026-07 (PR #9).
-    If the binary's algorithm drifts on an upgrade, the exact-match resolution step
-    silently stops firing and everything falls to the substring heuristic — re-verify
-    this mapping (and its tests) when bumping the binary."""
+    This is used only for legacy list_projects responses without ``root_path``;
+    re-verify the mapping (and its tests) when bumping the binary."""
     out: list[str] = []
     for b in posix_path.encode("utf-8"):
         c = chr(b)
@@ -184,54 +186,85 @@ def _cbmc_name_map(posix_path: str) -> str:
     for pair, single in (("--", "-"), ("..", ".")):
         while pair in s:
             s = s.replace(pair, single)
-    s = s.lstrip("-.").rstrip("-")
-    return s or "root"
+    s = s.lstrip("-.").rstrip("-") or "root"
+    if len(s) > _CBMC_PROJECT_NAME_MAX:
+        h = 2166136261
+        for b in s.encode("ascii"):
+            h = ((h ^ b) * 16777619) & 0xFFFFFFFF
+        s = s[:_CBMC_PROJECT_NAME_MAX - 9] + f"-{h:08x}"
+    return s
 
 
 def _derive_cbmc_project_name(repo_path: str | Path) -> str:
     """Mirror CBMC's own path→project-name derivation. A naive
     ``path.replace("/", "-")`` keeps the drive colon on Windows and a leading dash
-    on POSIX — the exact-match step would then never fire and resolution would
-    always fall to the fuzzier substring heuristic."""
+    on POSIX, breaking the exact-name compatibility fallback for old indexes that
+    do not expose ``root_path``."""
     return _cbmc_name_map(Path(repo_path).resolve().as_posix())
+
+
+def _resolved_path_key(path: str | Path) -> str | None:
+    """Comparable local path, or None for malformed/stale project metadata."""
+    try:
+        return os.path.normcase(str(Path(path).resolve()))
+    except (OSError, RuntimeError, TypeError):
+        return None
 
 
 def _resolve_cbmc_project(
     repo_path: str, config: dict | None = None, binary: str | None = None
 ) -> str | None:
-    """Map a repo path to a CBMC project name — explicit config wins over heuristics.
+    """Map a repo path to a CBMC project name without guessing.
 
-    CBMC keys projects by a name derived from the indexed path. Guessing it by fuzzy
-    substring (as an earlier draft did) risks binding to the *wrong* project and
-    silently grounding descriptions in someone else's code, so we only accept an
-    exact match or a *unique* substring match; anything ambiguous returns None and
-    the caller falls back to file mode rather than guess. ``binary`` must be passed
-    through — a --cbmc-bin binary that isn't on PATH would otherwise make the
-    project listing silently come back empty."""
+    Current CBMC returns the authoritative ``root_path`` for every indexed project;
+    only an exact normalized path match is accepted. Older indexes that expose no
+    root paths may fall back to CBMC's exact path-derived name, never to a substring.
+    Anything else returns None so a repository cannot select an unrelated local
+    source index through its directory name. ``binary`` must be passed through — a
+    --cbmc-bin binary that isn't on PATH would otherwise make the listing empty."""
     # 1. explicit override: env var or legacy-reverse.toml [cbmc] project
     explicit = os.environ.get("LEGACY_REVERSE_CBMC_PROJECT") or (config or {}).get("project")
     if explicit:
         return explicit
 
-    projects, _info = cbmc_list_projects(binary=binary)
-    names = [p.get("name", "") for p in projects if p.get("name")]
-    if not names:
+    projects, info = cbmc_list_projects(binary=binary)
+    if not projects:
+        if info.get("error"):
+            print(f"  CBMC: could not list projects: {info['error']}")
         return None
 
     repo = Path(repo_path).resolve()
-    # 2. exact derived name (CBMC's own path→name algorithm)
-    expected = _derive_cbmc_project_name(repo)
-    if expected in names:
-        return expected
+    repo_key = _resolved_path_key(repo)
+    if repo_key is None:
+        print(f"  CBMC: could not normalize repository path '{repo}' — using file mode")
+        return None
+    rooted = [
+        p for p in projects
+        if isinstance(p, dict) and p.get("name") and p.get("root_path")
+        and _resolved_path_key(p["root_path"]) == repo_key
+    ]
+    if len(rooted) == 1:
+        return rooted[0]["name"]
+    if len(rooted) > 1:
+        names = [p["name"] for p in rooted]
+        print(f"  CBMC: several projects have root '{repo}': {names}; "
+              "set LEGACY_REVERSE_CBMC_PROJECT — using file mode")
+        return None
 
-    # 3. unique case-insensitive substring match on the repo folder name
-    repo_name = repo.name.lower()
-    subs = [n for n in names if repo_name in n.lower() or n.lower() in repo_name]
-    if len(subs) == 1:
-        return subs[0]
-    if len(subs) > 1:
-        print(f"  CBMC: ambiguous project for '{repo.name}': {subs}; "
-              "set [cbmc] project or LEGACY_REVERSE_CBMC_PROJECT — using file mode")
+    # Compatibility with older CBMC indexes that did not expose root_path. If at
+    # least one authoritative root is present, a non-match must fail closed.
+    if any(isinstance(p, dict) and p.get("root_path") for p in projects):
+        print(f"  CBMC: no indexed project rooted at '{repo}' — using file mode")
+        return None
+
+    expected = _derive_cbmc_project_name(repo)
+    exact = [
+        p["name"] for p in projects
+        if isinstance(p, dict) and p.get("name") == expected
+    ]
+    if len(exact) == 1:
+        return exact[0]
+    print(f"  CBMC: no exact project match for '{repo}' — using file mode")
     return None
 
 
@@ -240,7 +273,7 @@ def _setup_cbmc(args: argparse.Namespace, repo_path: Path) -> tuple[bool, str | 
 
     Trusted toml config is loaded even when ``--cbmc-bin`` overrides the binary —
     an explicit binary must not silently discard trusted ``[cbmc] project`` pinning
-    (losing it would drop project resolution to the fuzzier substring heuristic). Any gap
+    (older indexes may not expose a root path for automatic resolution). Any gap
     (binary unavailable, project unresolvable) disables grounding with a message
     rather than guessing."""
     if not args.use_cbmc:
@@ -273,6 +306,29 @@ def _extract_snippet(result: dict) -> tuple[str, list[str]]:
     return src, related[:5]
 
 
+def _qn_matches_fqn(qualified_name: str, fqn: str) -> bool:
+    """Case-sensitive graph-QN check for a Java package-qualified class name."""
+    normalized = qualified_name.replace("\\", ".").replace("/", ".")
+    return normalized == fqn or normalized.endswith("." + fqn)
+
+
+def _verified_snippet(result: dict | None, fqn: str) -> tuple[str, list[str]] | None:
+    """Return source only when CBMC proves it belongs to the expected Java FQN."""
+    if not result:
+        return None
+    actual = result.get("qualified_name")
+    if not isinstance(actual, str) or not _qn_matches_fqn(actual, fqn):
+        return None
+    src, related = _extract_snippet(result)
+    return (src, related) if src else None
+
+
+def _log_cbmc_errors(fqn: str, errors: list[str]) -> None:
+    if errors:
+        unique = list(dict.fromkeys(errors))
+        print(f"  CBMC fetch failed for {fqn}: {'; '.join(unique)}")
+
+
 def _fetch_class_code(
     cls: dict, project: str, binary: str | None, cbmc_timeout: float
 ) -> dict | None:
@@ -284,21 +340,29 @@ def _fetch_class_code(
     if not fqn:
         return None
 
+    errors: list[str] = []
     with _CBMC_CALL_SEM:
-        result, _info = cbmc_get_code_snippet(
+        result, info = cbmc_get_code_snippet(
             fqn, project=project, include_neighbors=True, binary=binary, timeout=cbmc_timeout
         )
-        if result:
-            src, related = _extract_snippet(result)
-            if src:
-                return {"fqn": fqn, "code": src, "related": related}
+        verified = _verified_snippet(result, fqn)
+        if verified:
+            src, related = verified
+            return {"fqn": fqn, "code": src, "related": related}
+        if info.get("error"):
+            errors.append(f"get_code_snippet: {info['error']}")
+        elif result and result.get("source"):
+            errors.append(
+                f"get_code_snippet returned foreign qualified_name "
+                f"{result.get('qualified_name')!r}"
+            )
 
         # fallback: arch.json name may differ from the graph's canonical qualified_name.
         # name_pattern + label=Class (exact-name regex, server-side label filter) beats a
         # BM25 `query` here: BM25 camelCase-splits the name and boosts Functions/Routes,
         # so the top hit for "OrderService" could be a method — not the class itself.
         name = cls.get("name", "")
-        sres, _ = (
+        sres, search_info = (
             cbmc_call(
                 "search_graph",
                 {"project": project, "name_pattern": f"^{re.escape(name)}$", "label": "Class",
@@ -307,6 +371,8 @@ def _fetch_class_code(
             )
             if name else (None, {})
         )
+        if search_info.get("error"):
+            errors.append(f"search_graph: {search_info['error']}")
         matches = (sres or {}).get("results") or []
         qns = list(dict.fromkeys(
             m["qualified_name"] for m in matches
@@ -318,22 +384,29 @@ def _fetch_class_code(
         # in foreign code. Without a pkg we can only trust a unique match.
         pkg = cls.get("pkg", "")
         if pkg:
-            want = f"{pkg}.{name}".lower()
-            qns = [q for q in qns
-                   if (norm := q.replace("/", ".").lower()) == want
-                   or norm.endswith("." + want)]
+            want = f"{pkg}.{name}"
+            qns = [q for q in qns if _qn_matches_fqn(q, want)]
         if len(qns) > 1:
             print(f"  CBMC: ambiguous graph match for {fqn}: {qns} — describing from signature")
+            _log_cbmc_errors(fqn, errors)
             return None
         qn = qns[0] if qns else ""
         if qn and qn != fqn:
-            result2, _ = cbmc_get_code_snippet(
+            result2, info2 = cbmc_get_code_snippet(
                 qn, project=project, include_neighbors=True, binary=binary, timeout=cbmc_timeout
             )
-            if result2:
-                src, related = _extract_snippet(result2)
-                if src:
-                    return {"fqn": fqn, "code": src, "related": related}
+            verified2 = _verified_snippet(result2, fqn)
+            if verified2:
+                src, related = verified2
+                return {"fqn": fqn, "code": src, "related": related}
+            if info2.get("error"):
+                errors.append(f"fallback get_code_snippet: {info2['error']}")
+            elif result2 and result2.get("source"):
+                errors.append(
+                    f"fallback returned foreign qualified_name "
+                    f"{result2.get('qualified_name')!r}"
+                )
+    _log_cbmc_errors(fqn, errors)
     return None
 
 
