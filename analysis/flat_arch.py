@@ -39,9 +39,13 @@ from index.search import build_search_index
 from summarizer import describe
 
 _GENERIC = re.compile(r"<[^<>]*>")
-_MODIFIERS = frozenset(
-    ("public", "private", "protected", "static", "final", "abstract", "synchronized")
-)
+# Java method modifiers are reserved words, always lowercase — so the membership
+# check must be case-sensitive: `Final`/`Static` are legal method names and must
+# not be mistaken for modifiers.
+_MODIFIERS = frozenset((
+    "public", "private", "protected", "static", "final", "abstract",
+    "synchronized", "native", "default", "strictfp",
+))
 
 
 # ------------------------------------------------------------
@@ -130,7 +134,7 @@ def _name_and_params(sig: str) -> tuple[str, list[str]]:
     before_paren = sig[: sig.index("(")].strip()
     tokens = before_paren.split()
     name = tokens[-1] if tokens else before_paren  # last token = name (return type precedes it)
-    if name.lower() in _MODIFIERS and len(tokens) > 1:
+    if name in _MODIFIERS and len(tokens) > 1:
         name = tokens[-2]
     inner = sig[sig.index("(") + 1 : sig.rfind(")")] if ")" in sig else sig[sig.index("(") + 1 :]
     inner = _GENERIC.sub("", inner).strip()

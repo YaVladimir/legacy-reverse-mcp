@@ -38,6 +38,11 @@ def test_name_and_params_peels_modifiers_and_return_type():
     # clean form (our own export) still works unchanged
     assert _name_and_params("make(String in): String") == ("make", ["String"])
     assert _name_and_params("reset()") == ("reset", [])
+    # modifiers are lowercase reserved words; `Final` is a legal method name and
+    # must not be peeled as one (a case-insensitive check would return "String")
+    assert _name_and_params("public String Final(String x)") == ("Final", ["String"])
+    # extended modifier set: native/default/strictfp are method modifiers too
+    assert _name_and_params("public native void ping()") == ("ping", [])
 
 
 def test_import_matches_method_with_modifier_laden_sig(tmp_path):
