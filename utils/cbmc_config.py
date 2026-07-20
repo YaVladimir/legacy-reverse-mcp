@@ -9,10 +9,12 @@ Config resolution for the binary path:
   4. Default: ~/.local/bin/codebase-memory-mcp, then PATH
 
 Steps 2 and 3 name an *executable* inside the repo being analyzed — a hostile
-legacy repo could point them at an arbitrary binary. They are therefore honored
-only when the user explicitly trusts the repo via LEGACY_REVERSE_TRUST_REPO_CONFIG=1;
-otherwise they are announced and skipped. The ``[cbmc] project`` toml key is plain
-data (a project name), so it is always read regardless of the trust flag.
+legacy repo could point them at an arbitrary binary. The ``[cbmc] project`` key
+also selects which local index is read and inlined into a generator prompt, so it
+can expose source from an unrelated project. Repo-supplied executable paths and
+project names are therefore honored only when the user explicitly trusts the repo
+via ``LEGACY_REVERSE_TRUST_REPO_CONFIG=1``; otherwise they are announced and
+skipped.
 """
 
 from __future__ import annotations
@@ -107,8 +109,7 @@ def _default_binary_path() -> str:
 
 
 def _repo_config_trusted() -> bool:
-    """The repo's own toml/.env may name an executable to run — that is only safe
-    when the user explicitly vouches for the repo being analyzed."""
+    """Whether repo-supplied executable paths and project selectors are trusted."""
     return os.environ.get("LEGACY_REVERSE_TRUST_REPO_CONFIG", "") == "1"
 
 
@@ -124,34 +125,43 @@ def resolve_cbmc_config(
       4. Standard user-local path ~/.local/bin/codebase-memory-mcp, then PATH lookup
 
     Returns (binary_path_or_None, config_dict). None means explicitly disabled.
-    The config dict is the toml ``[cbmc]`` section and is returned from every
-    branch — ``project`` pinning must survive whichever way the binary resolves.
+    The config dict is the trusted subset of the toml ``[cbmc]`` section and is
+    returned from every branch. A repo-supplied ``project`` is omitted unless the
+    trust flag is set because it controls which local source index is read.
     """
     repo = Path(repo_path) if repo_path else Path.cwd()
     toml_cfg = _load_cbmc_from_toml(repo / "legacy-reverse.toml")
+    repo_trusted = _repo_config_trusted()
+    resolved_cfg = dict(toml_cfg)
+    if not repo_trusted:
+        resolved_cfg.pop("binary_path", None)
+        if "project" in resolved_cfg:
+            resolved_cfg.pop("project")
+            print("CBMC: [cbmc] project in legacy-reverse.toml ignored (repo-supplied "
+                  "source selector); set LEGACY_REVERSE_TRUST_REPO_CONFIG=1 to allow it")
 
     # 1. User env var (highest priority)
     env_val = os.environ.get("LEGACY_REVERSE_CBMC_BIN")
     if env_val is not None:
-        return (env_val or None), toml_cfg
+        return (env_val or None), resolved_cfg
 
     # 2. Repo toml names an executable — honored only for explicitly trusted repos
     if "binary_path" in toml_cfg:
-        if _repo_config_trusted():
+        if repo_trusted:
             bp = toml_cfg["binary_path"]
             return (bp or None), toml_cfg
         print("CBMC: [cbmc] binary_path in legacy-reverse.toml ignored (repo-supplied "
               "executable); set LEGACY_REVERSE_TRUST_REPO_CONFIG=1 to allow it")
 
     # 3. Repo .env — same trust boundary as the toml
-    if _repo_config_trusted():
+    if repo_trusted:
         load_env_file(repo)
         env_val = os.environ.get("LEGACY_REVERSE_CBMC_BIN")
         if env_val:
             return env_val, toml_cfg
 
     # 4. Default — standard path or PATH
-    return _default_binary_path(), toml_cfg
+    return _default_binary_path(), resolved_cfg
 
 
 # ------------------------------------------------------------
@@ -189,12 +199,16 @@ def cbmc_call(
     # Build argv
     argv = [resolved, "cli", tool]
     if isinstance(args, dict):
-        # Convert dict to CLI flags: --key value; a False bool means "flag absent",
-        # not "--key ''" (an empty positional the binary would misparse)
+        # Convert dict to typed CLI flags. CBMC accumulates repeated array flags,
+        # while booleans require an explicit true/false value to preserve False
+        # when a tool's default is True.
         for key, value in args.items():
             if isinstance(value, bool):
-                if value:
-                    argv.extend([f"--{key}", "true"])
+                argv.extend([f"--{key}", "true" if value else "false"])
+                continue
+            if isinstance(value, (list, tuple)):
+                for item in value:
+                    argv.extend([f"--{key}", str(item)])
                 continue
             argv.extend([f"--{key}", str(value)])
     elif args:

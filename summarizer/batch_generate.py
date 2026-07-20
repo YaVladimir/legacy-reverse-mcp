@@ -238,9 +238,9 @@ def _resolve_cbmc_project(
 def _setup_cbmc(args: argparse.Namespace, repo_path: Path) -> tuple[bool, str | None, str | None]:
     """Resolve the CBMC binary + project for ``--use-cbmc``; (enabled, binary, project).
 
-    The toml config is loaded even when ``--cbmc-bin`` overrides the binary — an
-    explicit binary must not silently discard ``[cbmc] project`` pinning (losing it
-    would drop project resolution to the fuzzier substring heuristic). Any gap
+    Trusted toml config is loaded even when ``--cbmc-bin`` overrides the binary —
+    an explicit binary must not silently discard trusted ``[cbmc] project`` pinning
+    (losing it would drop project resolution to the fuzzier substring heuristic). Any gap
     (binary unavailable, project unresolvable) disables grounding with a message
     rather than guessing."""
     if not args.use_cbmc:

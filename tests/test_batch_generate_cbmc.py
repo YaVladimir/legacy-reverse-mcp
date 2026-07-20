@@ -229,8 +229,8 @@ def test_resolve_project_env_var_wins(monkeypatch):
 
 # --- _setup_cbmc: --cbmc-bin must not lose toml project pinning --------------
 
-def test_setup_cbmc_explicit_bin_keeps_toml_project(monkeypatch):
-    """--cbmc-bin overrides the binary but must NOT discard the toml [cbmc] project —
+def test_setup_cbmc_explicit_bin_keeps_trusted_toml_project(monkeypatch):
+    """--cbmc-bin overrides the binary but must NOT discard a trusted toml project —
     losing it silently drops project resolution to the substring heuristic (the old
     code passed an empty config dict whenever --cbmc-bin was given)."""
     monkeypatch.delenv("LEGACY_REVERSE_CBMC_PROJECT", raising=False)
