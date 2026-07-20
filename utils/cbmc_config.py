@@ -4,11 +4,15 @@ The binary runs on stdio (MCP protocol) — we call it via subprocess, not HTTP.
 
 Config resolution for the binary path:
   1. LEGACY_REVERSE_CBMC_BIN env var (user override)
-  2. legacy-reverse.toml → [cbmc] binary_path (project setting)
-  3. Default: codebase-memory-mcp (from PATH)
+  2. legacy-reverse.toml → [cbmc] binary_path (repo setting; opt-in, see below)
+  3. Repo .env → LEGACY_REVERSE_CBMC_BIN (opt-in, see below)
+  4. Default: ~/.local/bin/codebase-memory-mcp, then PATH
 
-The toml file is meant to be committed alongside the project.
-The .env file is for local development and is git-ignored by default.
+Steps 2 and 3 name an *executable* inside the repo being analyzed — a hostile
+legacy repo could point them at an arbitrary binary. They are therefore honored
+only when the user explicitly trusts the repo via LEGACY_REVERSE_TRUST_REPO_CONFIG=1;
+otherwise they are announced and skipped. The ``[cbmc] project`` toml key is plain
+data (a project name), so it is always read regardless of the trust flag.
 """
 
 from __future__ import annotations
@@ -35,9 +39,8 @@ def _load_env_file(path: Path) -> bool:
         return False
     text = path.read_text(encoding="utf-8")
     for m in _ENV_RE.finditer(text):
-        key, _, value = m.partition("=")
-        key = key.strip()
-        value = value.strip()
+        key = m.group(1)
+        value = m.group(2).strip()
         if (value.startswith('"') and value.endswith('"')) or (
             value.startswith("'") and value.endswith("'")
         ):
@@ -103,6 +106,12 @@ def _default_binary_path() -> str:
     return "codebase-memory-mcp"
 
 
+def _repo_config_trusted() -> bool:
+    """The repo's own toml/.env may name an executable to run — that is only safe
+    when the user explicitly vouches for the repo being analyzed."""
+    return os.environ.get("LEGACY_REVERSE_TRUST_REPO_CONFIG", "") == "1"
+
+
 def resolve_cbmc_config(
     repo_path: str | Path | None = None,
 ) -> tuple[str | None, dict[str, str]]:
@@ -110,36 +119,39 @@ def resolve_cbmc_config(
 
     Resolution order:
       1. LEGACY_REVERSE_CBMC_BIN env var (user override)
-      2. legacy-reverse.toml → [cbmc] binary_path (project setting)
-      3. Standard user-local path: ~/.local/bin/codebase-memory-mcp
-      4. PATH lookup: "codebase-memory-mcp"
+      2. legacy-reverse.toml → [cbmc] binary_path (only with LEGACY_REVERSE_TRUST_REPO_CONFIG=1)
+      3. Repo .env → LEGACY_REVERSE_CBMC_BIN (only with LEGACY_REVERSE_TRUST_REPO_CONFIG=1)
+      4. Standard user-local path ~/.local/bin/codebase-memory-mcp, then PATH lookup
 
-    Returns (binary_path_or_None, config_dict).
-    None means explicitly disabled.
+    Returns (binary_path_or_None, config_dict). None means explicitly disabled.
+    The config dict is the toml ``[cbmc]`` section and is returned from every
+    branch — ``project`` pinning must survive whichever way the binary resolves.
     """
     repo = Path(repo_path) if repo_path else Path.cwd()
+    toml_cfg = _load_cbmc_from_toml(repo / "legacy-reverse.toml")
 
     # 1. User env var (highest priority)
     env_val = os.environ.get("LEGACY_REVERSE_CBMC_BIN")
     if env_val is not None:
-        if not env_val:
-            return None, {}
-        return env_val, {}
+        return (env_val or None), toml_cfg
 
-    # 2. Project config (toml)
-    toml_cfg = _load_cbmc_from_toml(repo / "legacy-reverse.toml")
+    # 2. Repo toml names an executable — honored only for explicitly trusted repos
     if "binary_path" in toml_cfg:
-        bp = toml_cfg["binary_path"]
-        return bp if bp else None, toml_cfg
+        if _repo_config_trusted():
+            bp = toml_cfg["binary_path"]
+            return (bp or None), toml_cfg
+        print("CBMC: [cbmc] binary_path in legacy-reverse.toml ignored (repo-supplied "
+              "executable); set LEGACY_REVERSE_TRUST_REPO_CONFIG=1 to allow it")
 
-    # 3. Local .env file (no user env var set)
-    load_env_file(repo)
-    env_val = os.environ.get("LEGACY_REVERSE_CBMC_BIN")
-    if env_val:
-        return env_val if env_val else None, {}
+    # 3. Repo .env — same trust boundary as the toml
+    if _repo_config_trusted():
+        load_env_file(repo)
+        env_val = os.environ.get("LEGACY_REVERSE_CBMC_BIN")
+        if env_val:
+            return env_val, toml_cfg
 
     # 4. Default — standard path or PATH
-    return _default_binary_path(), {}
+    return _default_binary_path(), toml_cfg
 
 
 # ------------------------------------------------------------
@@ -177,9 +189,14 @@ def cbmc_call(
     # Build argv
     argv = [resolved, "cli", tool]
     if isinstance(args, dict):
-        # Convert dict to CLI flags: --key value
+        # Convert dict to CLI flags: --key value; a False bool means "flag absent",
+        # not "--key ''" (an empty positional the binary would misparse)
         for key, value in args.items():
-            argv.extend([f"--{key}", str(value) if not isinstance(value, bool) else "true" if value else ""])
+            if isinstance(value, bool):
+                if value:
+                    argv.extend([f"--{key}", "true"])
+                continue
+            argv.extend([f"--{key}", str(value)])
     elif args:
         argv.append(str(args))
 
@@ -203,20 +220,18 @@ def cbmc_call(
         info["error"] = proc.stderr.strip()[-500:]
         return None, info
 
-    # Parse JSON output (strip warning lines)
-    output = ""
-    for line in proc.stdout.splitlines():
-        if line.startswith("{"):
-            output += line
-            break
-    if not output:
+    # Parse JSON output: decode from the first '{' onwards, so warning lines
+    # before the payload and pretty-printed (multi-line) JSON both survive;
+    # raw_decode also tolerates trailing noise after the object.
+    start = proc.stdout.find("{")
+    if start == -1:
         return None, {**info, "error": "no JSON output"}
 
     try:
-        result = json.loads(output)
+        result, _ = json.JSONDecoder().raw_decode(proc.stdout[start:])
         return result, info
     except json.JSONDecodeError:
-        return None, {**info, "error": f"bad JSON: {output[:200]}"}
+        return None, {**info, "error": f"bad JSON: {proc.stdout[start:start + 200]}"}
 
 
 # ------------------------------------------------------------
