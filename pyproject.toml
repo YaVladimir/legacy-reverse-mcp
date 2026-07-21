@@ -28,7 +28,7 @@ build-backend = "setuptools.build_meta"
 py-modules = ["cli", "mcp_server"]
 
 [tool.setuptools.packages.find]
-include = ["analysis*", "scanner*", "index*", "summarizer*", "models*"]
+include = ["analysis*", "scanner*", "index*", "summarizer*", "models*", "utils*"]
 
 [tool.setuptools.package-data]
 index = ["schema.sql"]

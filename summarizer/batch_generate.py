@@ -42,10 +42,24 @@ from typing import Any
 from analysis.flat_arch import import_flat
 from index.repository import get_conn
 from summarizer.harness import HarnessConfig, _build_argv, _extract_json, gigacode_available
+from utils.cbmc_config import (
+    cbmc_available,
+    cbmc_call,
+    cbmc_get_code_snippet,
+    cbmc_list_projects,
+    resolve_cbmc_config,
+)
 
 _DEFAULT_CHUNK_SIZE = 25   # large chunks risk a truncated (unparseable) response
 _DEFAULT_PARALLEL = 5
 _DEFAULT_TIMEOUT = 900
+_DEFAULT_CBMC_TIMEOUT = 30.0
+_CBMC_FETCH_PARALLEL = 8   # per-chunk code-snippet fetches; independent of --parallel
+# --parallel chunk workers × _CBMC_FETCH_PARALLEL fetch threads would otherwise spawn
+# up to 40 binary processes at once (each CLI call is a full process start); this
+# caps process-level concurrency across all chunks.
+_CBMC_CALL_SEM = threading.BoundedSemaphore(16)
+_CBMC_PROJECT_NAME_MAX = 200  # fqn.c:FQN_MAX_NAME_LEN
 
 
 # ---------------------------------------------------------------------------
@@ -129,6 +143,365 @@ def _chunk_prompt(chunk_path: Path, idx: int, total: int) -> str:
 
 
 # ---------------------------------------------------------------------------
+# codebase-memory-mcp (CBMC) context — Layer-1 grounding for descriptions
+#
+# Instead of telling the generator "open file X and read it" (an agentic round-trip
+# that a text-only generator can't do at all), we pull the real source of each class
+# straight from the CBMC knowledge graph and inline it into the prompt. The model
+# then describes from actual code + its graph neighbours, not from a bare signature.
+# CBMC is entirely optional: any failure degrades to the file-based prompt, per class.
+# ---------------------------------------------------------------------------
+
+def _cls_fqn(cls: dict) -> str:
+    """Reconstruct the fully-qualified name arch.json carries (pkg + name)."""
+    pkg, name = cls.get("pkg", ""), cls.get("name", "")
+    return f"{pkg}.{name}" if pkg and name else name
+
+
+def _cbmc_name_map(posix_path: str) -> str:
+    """Pure mapping half of CBMC's path→project-name derivation
+    (fqn.c:cbm_project_name_from_path, everything after realpath): every byte
+    outside [A-Za-z0-9._-] maps to '-' (so ':' and both path separators go),
+    non-ASCII bytes become two lowercase hex digits, consecutive '-'/'.' collapse,
+    leading '-'/'.' and trailing '-' are trimmed. Names longer than 200 bytes keep
+    a 191-byte prefix plus an FNV-1a hash, matching ``fqn_bound_name_len``. Split
+    from the resolve() step so
+    the POSIX shape (leading '/' → trimmed leading dash: "/tmp/bench" →
+    "tmp-bench") stays testable on Windows, where resolve() would graft a drive
+    onto a POSIX-style path.
+
+    Pinned against the fqn.c shipped with codebase-memory-mcp as of 2026-07 (PR #9).
+    This is used only for legacy list_projects responses without ``root_path``;
+    re-verify the mapping (and its tests) when bumping the binary."""
+    out: list[str] = []
+    for b in posix_path.encode("utf-8"):
+        c = chr(b)
+        if c.isascii() and (c.isalnum() or c in "._-"):
+            out.append(c)
+        elif b >= 0x80:
+            out.append(f"{b:02x}")
+        else:
+            out.append("-")
+    s = "".join(out)
+    for pair, single in (("--", "-"), ("..", ".")):
+        while pair in s:
+            s = s.replace(pair, single)
+    s = s.lstrip("-.").rstrip("-") or "root"
+    if len(s) > _CBMC_PROJECT_NAME_MAX:
+        h = 2166136261
+        for b in s.encode("ascii"):
+            h = ((h ^ b) * 16777619) & 0xFFFFFFFF
+        s = s[:_CBMC_PROJECT_NAME_MAX - 9] + f"-{h:08x}"
+    return s
+
+
+def _derive_cbmc_project_name(repo_path: str | Path) -> str:
+    """Mirror CBMC's own path→project-name derivation. A naive
+    ``path.replace("/", "-")`` keeps the drive colon on Windows and a leading dash
+    on POSIX, breaking the exact-name compatibility fallback for old indexes that
+    do not expose ``root_path``."""
+    return _cbmc_name_map(Path(repo_path).resolve().as_posix())
+
+
+def _resolved_path_key(path: str | Path) -> str | None:
+    """Comparable local path, or None for malformed/stale project metadata."""
+    try:
+        return os.path.normcase(str(Path(path).resolve()))
+    except (OSError, RuntimeError, TypeError):
+        return None
+
+
+def _resolve_cbmc_project(
+    repo_path: str, config: dict | None = None, binary: str | None = None
+) -> str | None:
+    """Map a repo path to a CBMC project name without guessing.
+
+    Current CBMC returns the authoritative ``root_path`` for every indexed project;
+    only an exact normalized path match is accepted. Older indexes that expose no
+    root paths may fall back to CBMC's exact path-derived name, never to a substring.
+    Anything else returns None so a repository cannot select an unrelated local
+    source index through its directory name. ``binary`` must be passed through — a
+    --cbmc-bin binary that isn't on PATH would otherwise make the listing empty."""
+    # 1. explicit override: env var or legacy-reverse.toml [cbmc] project
+    explicit = os.environ.get("LEGACY_REVERSE_CBMC_PROJECT") or (config or {}).get("project")
+    if explicit:
+        return explicit
+
+    projects, info = cbmc_list_projects(binary=binary)
+    if not projects:
+        if info.get("error"):
+            print(f"  CBMC: could not list projects: {info['error']}")
+        return None
+
+    repo = Path(repo_path).resolve()
+    repo_key = _resolved_path_key(repo)
+    if repo_key is None:
+        print(f"  CBMC: could not normalize repository path '{repo}' — using file mode")
+        return None
+    rooted = [
+        p for p in projects
+        if isinstance(p, dict) and p.get("name") and p.get("root_path")
+        and _resolved_path_key(p["root_path"]) == repo_key
+    ]
+    if len(rooted) == 1:
+        return rooted[0]["name"]
+    if len(rooted) > 1:
+        names = [p["name"] for p in rooted]
+        print(f"  CBMC: several projects have root '{repo}': {names}; "
+              "set LEGACY_REVERSE_CBMC_PROJECT — using file mode")
+        return None
+
+    # Compatibility with older CBMC indexes that did not expose root_path. If at
+    # least one authoritative root is present, a non-match must fail closed.
+    if any(isinstance(p, dict) and p.get("root_path") for p in projects):
+        print(f"  CBMC: no indexed project rooted at '{repo}' — using file mode")
+        return None
+
+    expected = _derive_cbmc_project_name(repo)
+    exact = [
+        p["name"] for p in projects
+        if isinstance(p, dict) and p.get("name") == expected
+    ]
+    if len(exact) == 1:
+        return exact[0]
+    print(f"  CBMC: no exact project match for '{repo}' — using file mode")
+    return None
+
+
+def _setup_cbmc(args: argparse.Namespace, repo_path: Path) -> tuple[bool, str | None, str | None]:
+    """Resolve the CBMC binary + project for ``--use-cbmc``; (enabled, binary, project).
+
+    Trusted toml config is loaded even when ``--cbmc-bin`` overrides the binary —
+    an explicit binary must not silently discard trusted ``[cbmc] project`` pinning
+    (older indexes may not expose a root path for automatic resolution). Any gap
+    (binary unavailable, project unresolvable) disables grounding with a message
+    rather than guessing."""
+    if not args.use_cbmc:
+        return False, None, None
+    resolved_bin, cbmc_cfg = resolve_cbmc_config(str(repo_path))
+    cbmc_binary = args.cbmc_bin or resolved_bin
+    if not cbmc_available(cbmc_binary):
+        print(f"--use-cbmc: '{cbmc_binary}' unavailable — falling back to file mode")
+        return False, None, None
+    cbmc_project = _resolve_cbmc_project(str(repo_path), cbmc_cfg, binary=cbmc_binary)
+    if not cbmc_project:
+        print("--use-cbmc: could not resolve a CBMC project — falling back to file mode")
+        return False, cbmc_binary, None
+    print(f"CBMC grounding enabled: binary={cbmc_binary}, project={cbmc_project}")
+    return True, cbmc_binary, cbmc_project
+
+
+def _extract_snippet(result: dict) -> tuple[str, list[str]]:
+    """(source, related_names) from a get_code_snippet result.
+
+    With include_neighbors the binary returns ``caller_names`` + ``callee_names``
+    (plain string arrays) — there is no ``neighbors`` field in its response (the
+    original fork draft read one and always got an empty list, silently dropping
+    the related-classes context from every prompt)."""
+    src = (result.get("source") or "").strip()
+    related = [
+        n for n in (result.get("caller_names") or []) + (result.get("callee_names") or [])
+        if isinstance(n, str) and n
+    ]
+    return src, related[:5]
+
+
+def _qn_matches_fqn(qualified_name: str, fqn: str) -> bool:
+    """Case-sensitive graph-QN check for a Java package-qualified class name."""
+    normalized = qualified_name.replace("\\", ".").replace("/", ".")
+    return normalized == fqn or normalized.endswith("." + fqn)
+
+
+def _verified_snippet(result: dict | None, fqn: str) -> tuple[str, list[str]] | None:
+    """Return source only when CBMC proves it belongs to the expected Java FQN."""
+    if not result:
+        return None
+    actual = result.get("qualified_name")
+    if not isinstance(actual, str) or not _qn_matches_fqn(actual, fqn):
+        return None
+    src, related = _extract_snippet(result)
+    return (src, related) if src else None
+
+
+def _log_cbmc_errors(fqn: str, errors: list[str]) -> None:
+    if errors:
+        unique = list(dict.fromkeys(errors))
+        print(f"  CBMC fetch failed for {fqn}: {'; '.join(unique)}")
+
+
+def _fetch_class_code(
+    cls: dict, project: str, binary: str | None, cbmc_timeout: float
+) -> dict | None:
+    """Fetch one class's source from CBMC. FQN (pkg+name from arch.json) is the exact,
+    reliable key; only if it doesn't resolve do we fall back to a semantic search and
+    re-fetch by the resolved qualified name. Returns None (→ prompt degrades to the
+    signature for this class) when no code can be grounded."""
+    fqn = _cls_fqn(cls)
+    if not fqn:
+        return None
+
+    errors: list[str] = []
+    with _CBMC_CALL_SEM:
+        result, info = cbmc_get_code_snippet(
+            fqn, project=project, include_neighbors=True, binary=binary, timeout=cbmc_timeout
+        )
+        verified = _verified_snippet(result, fqn)
+        if verified:
+            src, related = verified
+            return {"fqn": fqn, "code": src, "related": related}
+        if info.get("error"):
+            errors.append(f"get_code_snippet: {info['error']}")
+        elif result and result.get("source"):
+            errors.append(
+                f"get_code_snippet returned foreign qualified_name "
+                f"{result.get('qualified_name')!r}"
+            )
+
+        # fallback: arch.json name may differ from the graph's canonical qualified_name.
+        # name_pattern + label=Class (exact-name regex, server-side label filter) beats a
+        # BM25 `query` here: BM25 camelCase-splits the name and boosts Functions/Routes,
+        # so the top hit for "OrderService" could be a method — not the class itself.
+        name = cls.get("name", "")
+        sres, search_info = (
+            cbmc_call(
+                "search_graph",
+                {"project": project, "name_pattern": f"^{re.escape(name)}$", "label": "Class",
+                 "limit": 5},
+                binary=binary, timeout=cbmc_timeout,
+            )
+            if name else (None, {})
+        )
+        if search_info.get("error"):
+            errors.append(f"search_graph: {search_info['error']}")
+        matches = (sres or {}).get("results") or []
+        qns = list(dict.fromkeys(
+            m["qualified_name"] for m in matches
+            if isinstance(m, dict) and m.get("qualified_name")
+        ))
+        # A simple-name hit may be a same-named class from another package. The
+        # canonical QN may carry a project/source-root prefix, but it must still end
+        # with OUR package-qualified name — otherwise this class would be grounded
+        # in foreign code. Without a pkg we can only trust a unique match.
+        pkg = cls.get("pkg", "")
+        if pkg:
+            want = f"{pkg}.{name}"
+            qns = [q for q in qns if _qn_matches_fqn(q, want)]
+        if len(qns) > 1:
+            print(f"  CBMC: ambiguous graph match for {fqn}: {qns} — describing from signature")
+            _log_cbmc_errors(fqn, errors)
+            return None
+        qn = qns[0] if qns else ""
+        if qn and qn != fqn:
+            result2, info2 = cbmc_get_code_snippet(
+                qn, project=project, include_neighbors=True, binary=binary, timeout=cbmc_timeout
+            )
+            verified2 = _verified_snippet(result2, fqn)
+            if verified2:
+                src, related = verified2
+                return {"fqn": fqn, "code": src, "related": related}
+            if info2.get("error"):
+                errors.append(f"fallback get_code_snippet: {info2['error']}")
+            elif result2 and result2.get("source"):
+                errors.append(
+                    f"fallback returned foreign qualified_name "
+                    f"{result2.get('qualified_name')!r}"
+                )
+    _log_cbmc_errors(fqn, errors)
+    return None
+
+
+def _fetch_chunk_context(
+    chunk_classes: list[dict], project: str, binary: str | None, cbmc_timeout: float
+) -> dict[str, dict]:
+    """Batch-fetch code for a chunk's classes via CBMC. Maps ``fqn -> {code, related}``
+    for the classes that grounded; failures are logged (not silently swallowed) and
+    simply absent from the map."""
+    results: dict[str, dict] = {}
+    with ThreadPoolExecutor(max_workers=_CBMC_FETCH_PARALLEL) as pool:
+        futures = {
+            pool.submit(_fetch_class_code, cls, project, binary, cbmc_timeout): cls
+            for cls in chunk_classes
+        }
+        for fut in as_completed(futures):
+            cls = futures[fut]
+            try:
+                res = fut.result()
+            except Exception as exc:  # noqa: BLE001 - one class must not sink the chunk
+                print(f"  CBMC fetch failed for {_cls_fqn(cls)}: {exc}")
+                continue
+            if res:
+                results[res["fqn"]] = res
+    return results
+
+
+_MAX_SNIPPET_CHARS = 8000  # per-class source cap; 5-class chunks stay ~10K tokens
+
+
+def _cbmc_chunk_prompt(
+    chunk_classes: list[dict], idx: int, total: int, ctx: dict[str, dict]
+) -> str:
+    """A prompt carrying the real code of each class inline (from CBMC) plus its graph
+    neighbours. Classes CBMC couldn't ground degrade to their signature, marked so the
+    model knows to describe conservatively rather than invent.
+
+    Three rules keep the response validatable: every class block leads with a
+    "Метаданные" JSON line so the id/pkg/name/sig echo the validator matches on is
+    *copyable, not guessable*; the method list to describe is spelled out (else the
+    model describes whatever it sees in the source — private helpers the index
+    doesn't know, missed overloads); and per-class source is capped so one huge
+    class can't push the whole chunk into a truncated, unparseable response."""
+    lines = [
+        f"Сгенерируй описания на русском для {len(chunk_classes)} классов Java-проекта "
+        f"(часть {idx + 1} из {total}).",
+        "Для каждого класса даны: строка 'Метаданные' (JSON), список 'Методы' и код "
+        "из knowledge graph.",
+        "Описывай ТОЛЬКО по коду. Если код не дан — опиши по сигнатуре и скажи об этом; "
+        "ничего не выдумывай.",
+        "",
+    ]
+    for cls in chunk_classes:
+        fqn = _cls_fqn(cls)
+        info = ctx.get(fqn)
+        meta = {k: cls.get(k) for k in ("id", "pkg", "name", "sig") if cls.get(k) is not None}
+        method_sigs = [m.get("sig") for m in cls.get("methods") or [] if m.get("sig")]
+        lines.append(f"--- {fqn} ---")
+        lines.append(f"Метаданные: {json.dumps(meta, ensure_ascii=False)}")
+        if method_sigs:
+            lines.append(f"Методы: {json.dumps(method_sigs, ensure_ascii=False)}")
+        if info and info.get("code"):
+            code = info["code"]
+            if len(code) > _MAX_SNIPPET_CHARS:
+                code = code[:_MAX_SNIPPET_CHARS] + "\n… [код усечён]"
+            lines.append("[Код из knowledge graph]")
+            lines.append(code)
+            related = info.get("related") or []
+            if related:
+                lines.append(f"[Связанные классы (только контекст, их описывать не нужно): "
+                             f"{', '.join(related)}]")
+        else:
+            lines.append("[Код не найден в knowledge graph — опиши по сигнатуре и скажи об этом]")
+        lines.append("")
+
+    lines.append(
+        "Верни ТОЛЬКО JSON в формате "
+        '{"classes": [{"id": "...", "pkg": "...", "name": "...", "sig": "...", '
+        '"description": "...", "methods": [{"sig": "...", "description": "..."}]}]}.'
+    )
+    lines.append(
+        "Поля id, pkg, name, sig каждого класса скопируй В ТОЧНОСТИ из его строки "
+        "'Метаданные'; sig каждого метода — из списка 'Методы'. Опиши каждый метод из "
+        "списка 1-2 предложениями по реальному коду; не добавляй методы, которых нет в "
+        "списке, и не пропускай перечисленные. "
+        "В description на русском: что делает класс, зачем он нужен, какую бизнес-задачу "
+        "решает; укажи побочные эффекты (запись в БД, отправка в Kafka, вызовы внешних "
+        "API, транзакционность) и инварианты, которые нужно сохранить при изменении кода. "
+        f"Верни ВСЕ {len(chunk_classes)} классов — ответ с меньшим числом классов "
+        "считается ошибкой. Без markdown и пояснений."
+    )
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # response validation
 # ---------------------------------------------------------------------------
 
@@ -136,6 +509,8 @@ def _normalize_id(cid: str) -> str:
     """Chunk ids are extension-less repo-relative paths, but models routinely echo
     them back cosmetically mutated (``.java`` appended, backslashes, ``./`` prefix)
     — compare canonical forms so a cosmetic rewrite doesn't reject a whole chunk."""
+    if not isinstance(cid, str):
+        return str(cid)
     cid = cid.replace("\\", "/").strip()
     while cid.startswith("./"):
         cid = cid[2:]
@@ -192,6 +567,33 @@ def _validate_chunk_result(
 # per-chunk runner (used by ThreadPoolExecutor)
 # ---------------------------------------------------------------------------
 
+def _build_prompt_for_chunk(
+    chunk_path: Path,
+    chunk_idx: int,
+    total_chunks: int,
+    chunk_classes: list[dict] | None,
+    *,
+    use_cbmc: bool,
+    cbmc_project: str | None,
+    cbmc_binary: str | None,
+    cbmc_timeout: float,
+) -> tuple[str, int | None]:
+    """(prompt, grounded_count) for one chunk.
+
+    With ``use_cbmc`` and a resolved project, the prompt inlines each class's real
+    source pulled from CBMC (Layer 1). Grounding is per-class: whatever CBMC can't
+    resolve degrades to its signature *within the same enriched prompt* — we don't
+    throw away a chunk's worth of grounded code just because one class was missing.
+    Only a total miss (nothing grounded) reverts the chunk to the file-based prompt.
+    ``grounded_count`` is None when CBMC wasn't in play at all (pure file mode)."""
+    if use_cbmc and cbmc_project and chunk_classes:
+        ctx = _fetch_chunk_context(chunk_classes, cbmc_project, cbmc_binary, cbmc_timeout)
+        if ctx:
+            return _cbmc_chunk_prompt(chunk_classes, chunk_idx, total_chunks, ctx), len(ctx)
+        return _chunk_prompt(chunk_path, chunk_idx, total_chunks), 0
+    return _chunk_prompt(chunk_path, chunk_idx, total_chunks), None
+
+
 def _run_single_chunk(
     chunk_path: Path,
     chunk_idx: int,
@@ -200,9 +602,19 @@ def _run_single_chunk(
     gigacode_args: list[str],
     timeout: float,
     cwd: str | None,
+    *,
+    use_cbmc: bool = False,
+    cbmc_project: str | None = None,
+    cbmc_binary: str | None = None,
+    cbmc_timeout: float = _DEFAULT_CBMC_TIMEOUT,
+    chunk_classes: list[dict] | None = None,
 ) -> tuple[int, dict | None, dict]:
     """Shell out to GigaCode for one chunk; return (chunk_idx, parsed_or_None, info)."""
-    prompt = _chunk_prompt(chunk_path, chunk_idx, total_chunks)
+    prompt, grounded = _build_prompt_for_chunk(
+        chunk_path, chunk_idx, total_chunks, chunk_classes,
+        use_cbmc=use_cbmc, cbmc_project=cbmc_project,
+        cbmc_binary=cbmc_binary, cbmc_timeout=cbmc_timeout,
+    )
     config = HarnessConfig(
         cmd=gigacode_cmd, args=gigacode_args, prompt=prompt,
         output="stdout", timeout=timeout, cwd=cwd,
@@ -212,6 +624,9 @@ def _run_single_chunk(
         return chunk_idx, None, {"error": err}
 
     info: dict[str, Any] = {"cmd": gigacode_cmd}
+    if grounded is not None:
+        info["cbmc_grounded"] = grounded
+        info["cbmc_total"] = len(chunk_classes or [])
     try:
         proc = subprocess.run(
             argv, capture_output=True, text=True, encoding="utf-8", errors="replace",
@@ -301,6 +716,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="GigaCode command (default: LEGACY_REVERSE_GIGACODE_CMD or 'gigacode').")
     parser.add_argument("--gigacode-args", default=None,
                         help="Space-separated GigaCode args (default: '-p').")
+    parser.add_argument("--use-cbmc", action="store_true",
+                        help="Ground each chunk in real source pulled from the codebase-memory-mcp "
+                             "knowledge graph (Layer 1) before calling the generator, instead of "
+                             "asking it to open files. Improves quality for text-only generators "
+                             "and removes file-opening round-trips. Degrades to file mode per class "
+                             "when CBMC is unavailable or a class isn't in the graph.")
+    parser.add_argument("--cbmc-bin", default=None,
+                        help="Path to the codebase-memory-mcp binary (default: LEGACY_REVERSE_CBMC_BIN "
+                             "or legacy-reverse.toml [cbmc] binary_path or PATH).")
+    parser.add_argument("--cbmc-timeout", type=float, default=_DEFAULT_CBMC_TIMEOUT,
+                        help=f"Per-class CBMC fetch timeout in seconds (default: {_DEFAULT_CBMC_TIMEOUT:.0f}).")
     parser.add_argument("--work-dir", default=None,
                         help="Working directory for chunk files (default: <repo>/.reverse/batch).")
     parser.add_argument("--no-import", action="store_true",
@@ -366,6 +792,9 @@ def main(argv: list[str] | None = None) -> None:  # noqa: C901 - linear orchestr
     gigacode_cmd = args.gigacode_cmd or os.environ.get("LEGACY_REVERSE_GIGACODE_CMD", "gigacode")
     raw_args = args.gigacode_args or os.environ.get("LEGACY_REVERSE_GIGACODE_ARGS", "-p")
     gigacode_args = raw_args.split()
+
+    # 4b. codebase-memory-mcp (Layer-1 grounding) — resolve once, degrade cleanly ----
+    use_cbmc, cbmc_binary, cbmc_project = _setup_cbmc(args, repo_path)
 
     # 5/6. produce raw results: run GigaCode, or pick up outputs from disk ----
     project_name = original.get("project", "unknown")
@@ -450,7 +879,10 @@ def main(argv: list[str] | None = None) -> None:  # noqa: C901 - linear orchestr
         with ThreadPoolExecutor(max_workers=args.parallel) as pool:
             future_map = {
                 pool.submit(_run_single_chunk, chunk_path, chunk_idx, total_chunks,
-                            gigacode_cmd, gigacode_args, args.timeout, cwd): chunk_idx
+                            gigacode_cmd, gigacode_args, args.timeout, cwd,
+                            use_cbmc=use_cbmc, cbmc_project=cbmc_project,
+                            cbmc_binary=cbmc_binary, cbmc_timeout=args.cbmc_timeout,
+                            chunk_classes=sent_by_idx[chunk_idx]): chunk_idx
                 for chunk_idx, chunk_path in work_items
             }
             for fut in as_completed(future_map):
@@ -461,6 +893,14 @@ def main(argv: list[str] | None = None) -> None:  # noqa: C901 - linear orchestr
                 raw_results.append(result)
                 progress.tick(result[1] is not None)
         print(progress.done_line())
+
+        # CBMC grounding summary (kept out of the \r progress line to avoid clobber)
+        if use_cbmc:
+            g = sum(i.get("cbmc_grounded", 0) for _, _, i in raw_results)
+            t = sum(i.get("cbmc_total", 0) for _, _, i in raw_results if "cbmc_total" in i)
+            if t:
+                print(f"CBMC: grounded {g}/{t} classes in real source "
+                      f"({t - g} described from signature only)")
 
     # 7. validate + merge -----------------------------------------------------
     merged_classes: list[dict] = []
@@ -519,7 +959,8 @@ def main(argv: list[str] | None = None) -> None:  # noqa: C901 - linear orchestr
             sys.exit(1)
         conn = get_conn(db_path)
         try:
-            stats = import_flat(conn, str(repo_path), merged, source="gigacode-batch")
+            import_source = "gigacode-batch+cbmc" if use_cbmc else "gigacode-batch"
+            stats = import_flat(conn, str(repo_path), merged, source=import_source)
             print("\n=== Import results ===")
             print(f"  Classes matched:   {stats['classes_matched']}/{stats['classes_total']}")
             print(f"  Methods matched:   {stats['methods_matched']}")
