@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import sqlite3
 
-from analysis.common import ev, limitations
+from analysis.common import conf_str, ev, limitations, min_confidence
 from index.queries import _simple_type, find_code_areas
 
 # role -> selection priority (lower = stronger)
@@ -156,7 +156,10 @@ def generate_context_pack(
         "excluded_items": excluded,
         "context_markdown": context_markdown,
         "matched": found["counts"],
-        "confidence": selected[0]["confidence"] if selected else "unknown",
+        # weakest link across everything included — a pack whose tail is
+        # low-confidence keyword matches must not inherit the head's "high"
+        "confidence": conf_str(min_confidence(s["confidence"] for s in selected))
+        if selected else "unknown",
         "limitations": limitations("syntactic_calls", "no_call_graph", "ambiguous_simple_name"),
         "warnings": [] if selected else ["No code areas matched the task query."],
     }

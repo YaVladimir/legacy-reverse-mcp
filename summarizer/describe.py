@@ -555,15 +555,23 @@ def _describe_class(
             stats["from_cache"] += 1
         else:
             result = None
+            llm_failed = False
             if llm.enabled:
                 raw = llm.complete(system=_system_prompt(lang), user=_user_prompt(skeleton, snippet))
                 result = _parse_class_json(raw) if raw else None
                 if result is not None:
                     stats["from_llm"] += 1
+                else:
+                    llm_failed = True
             if result is None:
                 result = _class_fallback(conn, class_id, skeleton)
                 stats["from_fallback"] += 1
-            _cache_put(cache, ref_key, h, result, model, lang)
+            # A fallback produced because the LLM *failed* (timeout, 5xx, bad JSON)
+            # must not be cached under the LLM's model key: it would be served as a
+            # cache hit forever and the class would never be retried. With the LLM
+            # disabled the fallback IS the final answer, so caching is correct.
+            if not llm_failed:
+                _cache_put(cache, ref_key, h, result, model, lang)
         # a class with no imported class-text may still have per-method imports
         if imp_methods:
             result.setdefault("methods", {}).update(imp_methods)

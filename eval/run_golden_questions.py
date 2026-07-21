@@ -129,13 +129,16 @@ def run() -> dict:
     questions = yaml.safe_load(QUESTIONS.read_text(encoding="utf-8"))["questions"]
 
     tmp = Path(tempfile.mkdtemp(prefix="lrmcp-golden-"))
-    repo = tmp / "fixture"
-    shutil.copytree(FIXTURE, repo)
-    conn = init_db(repo / ".reverse" / "index.sqlite3")
-    scan = build_index(conn, str(repo))
-
+    conn = None
     results = []
     try:
+        # inside the try: a failing fixture scan must still close the conn and
+        # remove the temp dir (locked files pile up on CI runners otherwise)
+        repo = tmp / "fixture"
+        shutil.copytree(FIXTURE, repo)
+        conn = init_db(repo / ".reverse" / "index.sqlite3")
+        scan = build_index(conn, str(repo))
+
         for q in questions:
             try:
                 result = call_tool(conn, q["tool"], q.get("input", {}))
@@ -152,7 +155,8 @@ def run() -> dict:
                 }
             )
     finally:
-        conn.close()
+        if conn is not None:
+            conn.close()
         shutil.rmtree(tmp, ignore_errors=True)
 
     passed = sum(1 for r in results if r["passed"])

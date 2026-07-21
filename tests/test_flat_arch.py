@@ -187,8 +187,10 @@ def test_harness_imports_fake_gigacode_output(tmp_path, monkeypatch):
     }
     monkeypatch.setattr(harness.shutil, "which", lambda c: r"C:\fake\gigacode.exe")
     monkeypatch.setattr(
-        harness.subprocess, "run",
-        lambda argv, **kw: types.SimpleNamespace(returncode=0, stdout=json.dumps(flat), stderr=""),
+        harness, "run_tree_captured",
+        lambda argv, **kw: types.SimpleNamespace(
+            returncode=0, stdout=json.dumps(flat), stderr="", error=None
+        ),
     )
     stats = harness.generate_architecture(conn, str(repo))
     assert stats["status"] == "imported"
@@ -217,7 +219,8 @@ def mcp_repo(tmp_path_factory):
     repo = write_fixture_repo(tmp_path_factory.mktemp("mcp_arch") / "repo")
     mcp_server.scan_repository(str(repo))
     mcp_server.generate_descriptions(no_llm=True)
-    return repo
+    yield repo
+    mcp_server._active_repo = None  # don't leak this repo into other test modules
 
 
 def test_mcp_export_then_import(mcp_repo, tmp_path):

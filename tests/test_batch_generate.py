@@ -219,9 +219,10 @@ def test_unparseable_retry_does_not_clobber_good_sidecar(tmp_path, monkeypatch):
         returncode = 0
         stdout = "sorry, no JSON here"
         stderr = ""
+        error = None
 
-    monkeypatch.setattr(bg, "_build_argv", lambda cfg: (["gigacode", "-p", cfg.prompt], None))
-    monkeypatch.setattr(bg.subprocess, "run", lambda *a, **k: _Proc())
+    monkeypatch.setattr(bg, "_build_argv", lambda cfg: (["gigacode", "-p", cfg.prompt], None, None))
+    monkeypatch.setattr(bg, "run_tree_captured", lambda *a, **k: _Proc())
 
     idx, data, info = _run_single_chunk(chunk_path, 0, 1, "gigacode", ["-p"], 10.0, None)
     assert data is None

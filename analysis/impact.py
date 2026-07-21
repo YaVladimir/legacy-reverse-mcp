@@ -15,6 +15,9 @@ from analysis.common import ev, limitations
 from index.queries import _simple_type
 
 _HIGH_VIA = {"call", "field", "field_injection", "inheritance"}
+# bound for the dependents closure used to reach endpoint controllers; typical
+# layered chains are 2-3 hops, anything deeper is a weak candidate anyway
+_MAX_TRANSITIVE_DEPTH = 6
 
 
 def _type_matches(type_str: str | None, target_fqns: set[str], target_simples: set[str]) -> bool:
@@ -126,7 +129,29 @@ def change_impact(conn: sqlite3.Connection, symbol: str, limit: int = 60) -> dic
 
     # ---- candidate impacts ---------------------------------------------
     candidate_impacts = []
-    controller_ids = list(target_ids) + list(dependents.keys())
+    # Transitive closure UP the dependency graph. Endpoints hang off controllers
+    # that usually sit 2+ hops above the changed class (controller -> service ->
+    # repository), so 1-hop dependents alone answer the most common question —
+    # "I'm changing the repository, which APIs are affected?" — with silence.
+    depth_by_id: dict[int, int] = {cid: 1 for cid in dependents}
+    frontier = list(dependents.keys())
+    depth = 1
+    while frontier and depth < _MAX_TRANSITIVE_DEPTH:
+        depth += 1
+        ph_f = ",".join("?" * len(frontier))
+        frontier = [
+            r["cid"]
+            for r in conn.execute(
+                f"SELECT DISTINCT from_class_id AS cid FROM class_dependency "
+                f"WHERE to_class_id IN ({ph_f})",
+                frontier,
+            )
+            if r["cid"] not in depth_by_id and r["cid"] not in target_ids
+        ]
+        for cid in frontier:
+            depth_by_id[cid] = depth
+
+    controller_ids = list(target_ids) + list(depth_by_id)
     ph2 = ",".join("?" * len(controller_ids))
     seen_ep = set()
     for r in conn.execute(
@@ -140,17 +165,20 @@ def change_impact(conn: sqlite3.Connection, symbol: str, limit: int = 60) -> dic
             continue
         seen_ep.add(key)
         is_target_ctrl = r["controller_class_id"] in target_ids
-        reason = (
-            f"Endpoint is exposed by the changed class {r['ctrl']}"
-            if is_target_ctrl
-            else f"Endpoint controller {r['ctrl']} depends on {symbol}"
-        )
+        hops = depth_by_id.get(r["controller_class_id"], 0)
+        if is_target_ctrl:
+            reason = f"Endpoint is exposed by the changed class {r['ctrl']}"
+        elif hops <= 1:
+            reason = f"Endpoint controller {r['ctrl']} depends on {symbol}"
+        else:
+            reason = f"Endpoint controller {r['ctrl']} transitively depends on {symbol} ({hops} hops)"
         candidate_impacts.append(
             {
                 "kind": "endpoint",
                 "target": f"{r['http_method']} {r['full_path']}",
                 "reason": reason,
-                "confidence": "medium",
+                # a longer chain is a weaker (still honest) candidate signal
+                "confidence": "medium" if is_target_ctrl or hops <= 1 else "low",
                 "evidence": [
                     ev("mapping_annotation", f"{r['http_method']} {r['full_path']} -> {r['ctrl']}",
                        symbol=r["ctrl"])

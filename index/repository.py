@@ -290,6 +290,11 @@ def clear_class_members(conn: sqlite3.Connection, class_id: int, commit: bool = 
     method_annotation / method_parameter rows cascade from method via FK.
     """
     conn.execute("DELETE FROM method_call WHERE caller_class_id = ?", (class_id,))
+    # endpoints must go BEFORE methods: deleting methods first flips their
+    # handler_method_id to NULL (FK SET NULL) and, when the same FQN appears in
+    # two files in one scan, leaves orphaned non-superseded rows that duplicate
+    # the re-indexed endpoints in v_endpoint_full
+    conn.execute("DELETE FROM endpoint WHERE controller_class_id = ?", (class_id,))
     conn.execute("DELETE FROM method WHERE class_id = ?", (class_id,))
     conn.execute("DELETE FROM field WHERE class_id = ?", (class_id,))
     conn.execute("DELETE FROM class_annotation WHERE class_id = ?", (class_id,))

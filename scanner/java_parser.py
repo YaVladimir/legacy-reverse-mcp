@@ -366,11 +366,21 @@ def _class_body(decl: Node) -> Node | None:
 
 
 def _parse_type_declaration(
-    decl: Node, package: str | None, file_path: str, package_line: int | None = None
-) -> ParsedClass:
+    decl: Node,
+    package: str | None,
+    file_path: str,
+    package_line: int | None = None,
+    enclosing: str | None = None,
+) -> list[ParsedClass]:
+    """Parse one type declaration AND its nested member types (recursively).
+
+    Returns ``[outer, *nested]``. A nested type keeps its own ``simple_name``
+    ("AdminApi") so simple-name lookups still work, while its ``fqn`` carries
+    the source-level qualification ("com.a.OrderController.AdminApi")."""
     modifiers = _modifiers_node(decl)
     simple_name = _text(decl.child_by_field_name("name")) or "<anonymous>"
-    fqn = f"{package}.{simple_name}" if package else simple_name
+    qualified = f"{enclosing}.{simple_name}" if enclosing else simple_name
+    fqn = f"{package}.{qualified}" if package else qualified
 
     parsed = ParsedClass(
         simple_name=simple_name,
@@ -388,6 +398,25 @@ def _parse_type_declaration(
         annotations=_collect_annotations(modifiers),
     )
 
+    # record components live in the HEADER, not the class body — without this a
+    # record has zero fields and its component types produce no dependency edges
+    if decl.type == "record_declaration":
+        params = decl.child_by_field_name("parameters")
+        if params is not None:
+            for comp in params.children:
+                if comp.type != "formal_parameter":
+                    continue
+                comp_name = _text(comp.child_by_field_name("name"))
+                if comp_name:
+                    parsed.fields.append(ParsedField(
+                        name=comp_name,
+                        type_fqn=_text(comp.child_by_field_name("type")),
+                        visibility="private",
+                        is_final=True,
+                        line=comp.start_point[0] + 1,
+                    ))
+
+    out = [parsed]
     body = _class_body(decl)
     if body is not None:
         for member in body.children:
@@ -395,8 +424,14 @@ def _parse_type_declaration(
                 parsed.fields.extend(_parse_field(member))
             elif member.type in ("method_declaration", "constructor_declaration"):
                 parsed.methods.append(_parse_method(member, simple_name))
+            elif member.type in TYPE_DECLARATIONS:
+                out.extend(
+                    _parse_type_declaration(
+                        member, package, file_path, package_line, enclosing=qualified
+                    )
+                )
         parsed.ctor_injected_fields = _collect_ctor_injected_fields(body)
-    return parsed
+    return out
 
 
 def parse_source(source: bytes, file_path: str) -> ParsedFile:
@@ -418,10 +453,10 @@ def parse_source(source: bytes, file_path: str) -> ParsedFile:
                 imports.append(_text(ident))
 
     result = ParsedFile(file_path=file_path, package=package, imports=imports)
-    # type declarations can be nested under the program node directly
     for node in root.children:
         if node.type in TYPE_DECLARATIONS:
-            result.classes.append(
+            # returns the type plus all its nested member types
+            result.classes.extend(
                 _parse_type_declaration(node, package, file_path, package_line)
             )
     return result

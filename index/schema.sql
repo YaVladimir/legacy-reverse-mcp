@@ -141,6 +141,9 @@ CREATE TABLE IF NOT EXISTS method_parameter (
     name            TEXT,
     type_fqn        TEXT
 );
+-- самый горячий per-method запрос (class_detail, describe): без индекса —
+-- полный скан таблицы на каждый метод
+CREATE INDEX IF NOT EXISTS idx_method_parameter_method ON method_parameter(method_id);
 
 -- ------------------------------------------------------------
 -- Поля класса

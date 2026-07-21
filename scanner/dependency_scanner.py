@@ -195,7 +195,16 @@ def parse_maven_module(pom_path: Path) -> ModuleDeps:
             child = el.find(tag)
         return child.text.strip() if child is not None and child.text else None
 
-    for dep in root.iter():
+    # ONLY the project-level <dependencies> block: root.iter() would also sweep
+    # <dependencyManagement> (managed versions, not actual deps), build-plugin
+    # dependencies and profile blocks — a parent pom with 80 managed artifacts
+    # would show 80 phantom external dependencies.
+    deps_el = root.find("m:dependencies", POM_NS)
+    if deps_el is None:
+        deps_el = root.find("dependencies")
+    if deps_el is None:
+        return deps
+    for dep in list(deps_el):
         if not dep.tag.endswith("dependency"):
             continue
         group_id = _find(dep, "groupId")
@@ -206,6 +215,18 @@ def parse_maven_module(pom_path: Path) -> ModuleDeps:
         scope = _find(dep, "scope") or "compile"
         deps.external.append(ExternalDep(group_id, artifact_id, version, scope))
     return deps
+
+
+def _maven_artifact_id(pom_path: Path) -> str | None:
+    """The pom's OWN artifactId (not a dependency's)."""
+    try:
+        root = ET.parse(pom_path).getroot()
+    except (ET.ParseError, OSError):
+        return None
+    el = root.find("m:artifactId", POM_NS)
+    if el is None:
+        el = root.find("artifactId")
+    return el.text.strip() if el is not None and el.text else None
 
 
 # ------------------------------------------------------------
@@ -225,9 +246,24 @@ def index_dependencies(conn, repo_path: str) -> DepStats:
     by_path = {_normalize(m["path"]): m["id"] for m in modules}
     by_name = {m["name"]: m["id"] for m in modules}
 
+    def _module_dir(m):
+        return repo_root if _normalize(m["path"]) in ("", ".") else repo_root / m["path"]
+
+    # Maven has no project(':x') syntax — an inter-module dependency looks like an
+    # ordinary GAV. Map every maven module's own artifactId up front so sibling
+    # references become module edges instead of phantom external artifacts
+    # (without this, module_dependency stays empty on pure-Maven repos and the
+    # circular_dependency finding can never fire).
+    artifact_to_module: dict[str, int] = {}
+    for m in modules:
+        if (m["build_file"] or "").lower() == "pom.xml":
+            aid = _maven_artifact_id(_module_dir(m) / "pom.xml")
+            if aid:
+                artifact_to_module.setdefault(aid, m["id"])
+
     for m in modules:
         module_id = m["id"]
-        module_dir = repo_root if _normalize(m["path"]) in ("", ".") else repo_root / m["path"]
+        module_dir = _module_dir(m)
         build_file = (m["build_file"] or "").lower()
 
         if build_file == "pom.xml":
@@ -245,6 +281,13 @@ def index_dependencies(conn, repo_path: str) -> DepStats:
                 stats.unresolved_refs.append(f"{m['name']} -> {gpath}")
 
         for ext in deps.external:
+            to_id = (
+                artifact_to_module.get(ext.artifact_id) if build_file == "pom.xml" else None
+            )
+            if to_id and to_id != module_id:
+                repo.insert_module_dependency(conn, module_id, to_id, ext.scope, commit=False)
+                stats.module_edges += 1
+                continue
             repo.insert_external_dependency(
                 conn, module_id, ext.group_id, ext.artifact_id, ext.version, ext.scope, commit=False
             )

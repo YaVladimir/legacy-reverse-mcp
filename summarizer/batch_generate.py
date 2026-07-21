@@ -31,7 +31,6 @@ import json
 import os
 import re
 import shutil
-import subprocess
 import sys
 import threading
 import time
@@ -42,6 +41,7 @@ from typing import Any
 from analysis.flat_arch import import_flat
 from index.repository import get_conn
 from summarizer.harness import HarnessConfig, _build_argv, _extract_json, gigacode_available
+from utils.proc import run_tree_captured
 from utils.cbmc_config import (
     cbmc_available,
     cbmc_call,
@@ -205,6 +205,12 @@ def _derive_cbmc_project_name(repo_path: str | Path) -> str:
 
 def _resolved_path_key(path: str | Path) -> str | None:
     """Comparable local path, or None for malformed/stale project metadata."""
+    s = str(path)
+    # a POSIX-absolute path on Windows (e.g. a root_path recorded by a WSL-built
+    # index) is a FOREIGN filesystem: resolve() would graft the current drive
+    # onto it and manufacture a false match — fail closed instead
+    if os.name == "nt" and s.startswith("/") and not s.startswith("//"):
+        return None
     try:
         return os.path.normcase(str(Path(path).resolve()))
     except (OSError, RuntimeError, TypeError):
@@ -312,12 +318,23 @@ def _qn_matches_fqn(qualified_name: str, fqn: str) -> bool:
     return normalized == fqn or normalized.endswith("." + fqn)
 
 
+_RELOCATION_MARKERS = frozenset(
+    ("shaded", "shadow", "vendor", "vendored", "third_party", "thirdparty")
+)
+
+
 def _verified_snippet(result: dict | None, fqn: str) -> tuple[str, list[str]] | None:
     """Return source only when CBMC proves it belongs to the expected Java FQN."""
     if not result:
         return None
     actual = result.get("qualified_name")
     if not isinstance(actual, str) or not _qn_matches_fqn(actual, fqn):
+        return None
+    # suffix-matched relocated copies (fat-jar shading: shaded.com.a.X ends with
+    # .com.a.X) pass the QN check but are somebody else's (possibly other-version)
+    # code — reject when the source file lives under a relocation directory
+    fp = (result.get("file_path") or "").replace("\\", "/").lower()
+    if any(seg in _RELOCATION_MARKERS for seg in fp.split("/")):
         return None
     src, related = _extract_snippet(result)
     return (src, related) if src else None
@@ -594,6 +611,25 @@ def _build_prompt_for_chunk(
     return _chunk_prompt(chunk_path, chunk_idx, total_chunks), None
 
 
+def _sidecar_class_key(c: dict) -> str:
+    return str(c.get("id") or f"{c.get('pkg', '')}.{c.get('name', '')}")
+
+
+def _merge_sidecar_classes(sidecar: Path, data: dict) -> dict:
+    """Union a new chunk result with the previous good sidecar; new entries win."""
+    if not sidecar.exists() or not isinstance(data.get("classes"), list):
+        return data
+    old = _extract_json(sidecar.read_text(encoding="utf-8", errors="replace"))
+    old_classes = (old or {}).get("classes")
+    if not isinstance(old_classes, list):
+        return data
+    have = {_sidecar_class_key(c) for c in data["classes"] if isinstance(c, dict)}
+    for c in old_classes:
+        if isinstance(c, dict) and _sidecar_class_key(c) not in have:
+            data["classes"].append(c)
+    return data
+
+
 def _run_single_chunk(
     chunk_path: Path,
     chunk_idx: int,
@@ -619,7 +655,7 @@ def _run_single_chunk(
         cmd=gigacode_cmd, args=gigacode_args, prompt=prompt,
         output="stdout", timeout=timeout, cwd=cwd,
     )
-    argv, err = _build_argv(config)
+    argv, stdin_text, err = _build_argv(config)
     if argv is None:
         return chunk_idx, None, {"error": err}
 
@@ -627,16 +663,11 @@ def _run_single_chunk(
     if grounded is not None:
         info["cbmc_grounded"] = grounded
         info["cbmc_total"] = len(chunk_classes or [])
-    try:
-        proc = subprocess.run(
-            argv, capture_output=True, text=True, encoding="utf-8", errors="replace",
-            timeout=config.timeout, cwd=config.cwd,
-        )
-    except subprocess.TimeoutExpired:
-        info["error"] = f"gigacode timed out after {config.timeout:.0f}s"
-        return chunk_idx, None, info
-    except OSError as exc:
-        info["error"] = f"failed to run gigacode: {exc}"
+    proc = run_tree_captured(
+        argv, timeout=config.timeout, cwd=config.cwd, input_text=stdin_text,
+    )
+    if proc.error is not None:
+        info["error"] = f"gigacode {proc.error}"
         return chunk_idx, None, info
 
     info["returncode"] = proc.returncode
@@ -647,7 +678,11 @@ def _run_single_chunk(
     sidecar = chunk_path.with_name(f"chunk-{chunk_idx:04d}-stdout.txt")
     data = _extract_json(proc.stdout or "")
     if data is not None:
-        sidecar.write_text(proc.stdout or "", encoding="utf-8")
+        # union with the previous good sidecar (new wins): a retry returning a
+        # COMPLEMENTARY subset of classes must not shrink the accumulated result,
+        # or the next --resume re-spends the LLM on already-described classes
+        data = _merge_sidecar_classes(sidecar, data)
+        sidecar.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
     else:
         # keep the failed output beside the good sidecar for debugging, not over it
         sidecar.with_name(f"chunk-{chunk_idx:04d}-stdout.err.txt").write_text(
@@ -756,7 +791,12 @@ def main(argv: list[str] | None = None) -> None:  # noqa: C901 - linear orchestr
     if not arch_path.exists():
         print(f"ERROR: {arch_path} not found")
         sys.exit(1)
-    original: dict = json.loads(arch_path.read_text(encoding="utf-8"))
+    try:
+        original: dict = json.loads(arch_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError, OSError) as exc:
+        print(f"ERROR: {arch_path} is not readable JSON: {exc}")
+        print("Re-export it with: legacy-reverse export-arch --repo <repo> --out arch.json")
+        sys.exit(1)
     all_classes: list[dict] = original.get("classes") or []
     print(f"Loaded {len(all_classes)} classes from {arch_path}")
 
@@ -787,6 +827,21 @@ def main(argv: list[str] | None = None) -> None:  # noqa: C901 - linear orchestr
             for f in rs_dir.glob("chunk-*-stdout.txt"):
                 shutil.copy2(f, work_dir / f.name)
         print(f"Resume mode: working directory = {work_dir}")
+    elif not args.merge_only:
+        # Fresh run: clear leftovers of a previous generation. A re-generated
+        # arch.json usually produces fewer/differently-sliced chunks; stale
+        # higher-numbered chunk files and their sidecars would otherwise be
+        # picked up by a later --resume as "already succeeded" and stale
+        # descriptions would be imported with a fresh structure hash.
+        stale = [
+            f for pattern in ("chunk-*.json", "out-chunk-*.json",
+                              "chunk-*-stdout.txt", "chunk-*-stdout.err.txt")
+            for f in work_dir.glob(pattern)
+        ]
+        for f in stale:
+            f.unlink()
+        if stale:
+            print(f"Cleared {len(stale)} stale file(s) from a previous run in {work_dir}")
 
     # 4. gigacode config ------------------------------------------------------
     gigacode_cmd = args.gigacode_cmd or os.environ.get("LEGACY_REVERSE_GIGACODE_CMD", "gigacode")

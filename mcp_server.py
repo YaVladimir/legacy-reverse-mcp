@@ -8,6 +8,7 @@ The index lives at ``<repo>/.reverse/index.sqlite3``.
 
 from __future__ import annotations
 
+import functools
 import json
 import os
 from pathlib import Path
@@ -26,6 +27,26 @@ _DB_RELATIVE = Path(".reverse") / "index.sqlite3"
 _active_repo: Path | None = None
 
 
+class _IndexUnavailable(RuntimeError):
+    """Raised by the repo/db resolution helpers; carries the structured payload a
+    tool must return instead of letting a bare exception hit the MCP transport
+    (docs/mcp-api.md: errors are structured dicts with suggestions, never raises)."""
+
+    def __init__(self, payload: dict):
+        super().__init__(payload.get("message", "index unavailable"))
+        self.payload = payload
+
+
+def _structured_errors(fn):
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except _IndexUnavailable as exc:
+            return exc.payload
+    return wrapper
+
+
 def _resolve_repo() -> Path:
     global _active_repo
     if _active_repo is not None:
@@ -33,10 +54,15 @@ def _resolve_repo() -> Path:
     env = os.environ.get("LEGACY_REVERSE_REPO")
     if env:
         return Path(env).resolve()
-    raise RuntimeError(
-        "No repository indexed. Call scan_repository(repo_path=...) first "
-        "or set LEGACY_REVERSE_REPO."
-    )
+    raise _IndexUnavailable({
+        "error": "no_repository",
+        "kind": "repository",
+        "message": "No repository indexed in this process and LEGACY_REVERSE_REPO is not set.",
+        "suggestions": [
+            "Call scan_repository(repo_path=...) first",
+            "Or set the LEGACY_REVERSE_REPO environment variable",
+        ],
+    })
 
 
 def _db_path(repo: Path | None = None) -> Path:
@@ -44,14 +70,24 @@ def _db_path(repo: Path | None = None) -> Path:
     return repo / _DB_RELATIVE
 
 
+def _require_db(db: Path) -> None:
+    if not db.exists():
+        raise _IndexUnavailable({
+            "error": "no_index",
+            "kind": "index",
+            "message": f"Index not found at {db}.",
+            "suggestions": ["Run scan_repository(repo_path=...) to build the index"],
+        })
+
+
 def _read_conn():
     db = _db_path()
-    if not db.exists():
-        raise RuntimeError(f"Index not found at {db}. Run scan_repository first.")
+    _require_db(db)
     return get_conn(db)
 
 
 @mcp.tool()
+@_structured_errors
 def scan_repository(repo_path: str, force: bool = False) -> dict:
     """Scan a Java/Spring repo and (re)build its .reverse index."""
     global _active_repo
@@ -62,15 +98,25 @@ def scan_repository(repo_path: str, force: bool = False) -> dict:
         return {"status": "exists", "db_path": str(db), "hint": "pass force=true to rebuild"}
     if db.exists():
         db.unlink()
+        # a WAL-mode db leaves sidecars next to it; a stale pair from a previous
+        # process would be re-attached to the freshly created file
+        for sidecar in (db.with_name(db.name + "-wal"), db.with_name(db.name + "-shm")):
+            if sidecar.exists():
+                sidecar.unlink()
 
     conn = init_db(db)
-    summary = build_index(conn, str(repo))
-    conn.close()
+    try:
+        summary = build_index(conn, str(repo))
+    finally:
+        # without this, a failed build leaves the WAL connection open and (on
+        # Windows) the half-built index file locked until the server restarts
+        conn.close()
     _active_repo = repo
     return {"status": "scanned", "db_path": str(db), **summary}
 
 
 @mcp.tool()
+@_structured_errors
 def list_endpoints(http_method: str | None = None, path_contains: str | None = None, limit: int = 200) -> dict:
     """List REST endpoints (JAX-RS + Spring), optionally filtered by verb or path substring."""
     conn = _read_conn()
@@ -86,6 +132,7 @@ def list_endpoints(http_method: str | None = None, path_contains: str | None = N
 
 
 @mcp.tool()
+@_structured_errors
 def explain_class(fqn: str) -> dict:
     """Explain a class as observed facts + inferred findings (each with evidence,
     confidence) + related symbols + limitations. Accepts FQN or simple name."""
@@ -97,6 +144,7 @@ def explain_class(fqn: str) -> dict:
 
 
 @mcp.tool()
+@_structured_errors
 def get_class_summary(fqn: str) -> dict:
     """Deterministic one-line summary of a class (role, module, endpoints, injected
     dependencies, method count). Accepts FQN or simple name. The summarize_class
@@ -132,6 +180,7 @@ def get_class_summary(fqn: str) -> dict:
 
 
 @mcp.tool()
+@_structured_errors
 def generate_descriptions(force: bool = False, no_llm: bool = False) -> dict:
     """Generate meaningful natural-language descriptions for every class and method
     (and the package/module/project hierarchy) over the already-built index, so the
@@ -145,8 +194,7 @@ def generate_descriptions(force: bool = False, no_llm: bool = False) -> dict:
 
     repo = _resolve_repo()
     db = _db_path(repo)
-    if not db.exists():
-        raise RuntimeError(f"Index not found at {db}. Run scan_repository first.")
+    _require_db(db)
     conn = get_conn(db)
     try:
         stats = describe_repo(conn, str(repo), force=force, use_llm=not no_llm)
@@ -160,6 +208,7 @@ def generate_descriptions(force: bool = False, no_llm: bool = False) -> dict:
 
 
 @mcp.tool()
+@_structured_errors
 def find_feature(topic: str, limit: int = 20, methods_per_class: int = 12) -> dict:
     """Find the classes that implement a feature/topic (e.g. "банкротство / bankruptcy")
     and return each as a compact card with its methods, parameters and descriptions —
@@ -179,6 +228,7 @@ def find_feature(topic: str, limit: int = 20, methods_per_class: int = 12) -> di
 
 
 @mcp.tool()
+@_structured_errors
 def get_class_card(fqn: str) -> dict:
     """Full structured card for one class (reference-architecture parity): id, pkg,
     name, description, type, kind, class_modifiers, extends, implements, fields and
@@ -205,6 +255,7 @@ def get_class_card(fqn: str) -> dict:
 
 
 @mcp.tool()
+@_structured_errors
 def export_architecture(out_path: str | None = None) -> dict:
     """Render the whole index as a flat architecture JSON — reference-schema parity
     with the GigaCode architecture-generator (per class: id, pkg, name, description,
@@ -215,8 +266,7 @@ def export_architecture(out_path: str | None = None) -> dict:
 
     repo = _resolve_repo()
     db = _db_path(repo)
-    if not db.exists():
-        raise RuntimeError(f"Index not found at {db}. Run scan_repository first.")
+    _require_db(db)
     conn = get_conn(db)
     try:
         data = export_flat(conn, str(repo))
@@ -233,6 +283,7 @@ def export_architecture(out_path: str | None = None) -> dict:
 
 
 @mcp.tool()
+@_structured_errors
 def import_architecture(in_path: str) -> dict:
     """Load descriptions from a flat architecture JSON (e.g. produced by the GigaCode
     architecture-generator skill) into the index, so find_feature / get_class_card /
@@ -243,8 +294,7 @@ def import_architecture(in_path: str) -> dict:
 
     repo = _resolve_repo()
     db = _db_path(repo)
-    if not db.exists():
-        raise RuntimeError(f"Index not found at {db}. Run scan_repository first.")
+    _require_db(db)
     p = Path(in_path)
     if not p.exists():
         return not_found("file", in_path, [])
@@ -261,6 +311,7 @@ def import_architecture(in_path: str) -> dict:
 
 
 @mcp.tool()
+@_structured_errors
 def generate_architecture() -> dict:
     """Run gigacode-cli's architecture-generator skill and import its flat JSON,
     configured via LEGACY_REVERSE_GIGACODE_* env vars. On failure returns a structured
@@ -269,8 +320,7 @@ def generate_architecture() -> dict:
 
     repo = _resolve_repo()
     db = _db_path(repo)
-    if not db.exists():
-        raise RuntimeError(f"Index not found at {db}. Run scan_repository first.")
+    _require_db(db)
     conn = get_conn(db)
     try:
         stats = _gen(conn, str(repo))
@@ -281,6 +331,7 @@ def generate_architecture() -> dict:
 
 
 @mcp.tool()
+@_structured_errors
 def trace_endpoint(
     endpoint_id: int | None = None,
     http_method: str | None = None,
@@ -299,6 +350,7 @@ def trace_endpoint(
 
 
 @mcp.tool()
+@_structured_errors
 def get_project_overview() -> dict:
     """High-level overview: stack, totals, role distribution, top modules, findings."""
     conn = _read_conn()
@@ -310,6 +362,7 @@ def get_project_overview() -> dict:
 
 
 @mcp.tool()
+@_structured_errors
 def find_code_areas(query: str, limit: int = 20) -> dict:
     """Keyword search over classes, methods and endpoints, grouped by kind."""
     conn = _read_conn()
@@ -321,6 +374,7 @@ def find_code_areas(query: str, limit: int = 20) -> dict:
 
 
 @mcp.tool()
+@_structured_errors
 def get_findings(subject: str | None = None, finding_type: str | None = None, limit: int = 200) -> dict:
     """Inferred findings persisted during scan (e.g. low-confidence layer guesses
     for classes with no stereotype annotation), each with evidence + confidence."""
@@ -337,6 +391,7 @@ def get_findings(subject: str | None = None, finding_type: str | None = None, li
 
 
 @mcp.tool()
+@_structured_errors
 def get_config(key_contains: str | None = None, profile: str | None = None, limit: int = 200) -> dict:
     """Spring externalized configuration indexed from application*.{yml,properties}
     and bootstrap*.* — config files (with profile) plus individual properties,
@@ -364,6 +419,7 @@ def get_config(key_contains: str | None = None, profile: str | None = None, limi
 
 
 @mcp.tool()
+@_structured_errors
 def get_module_map() -> dict:
     """Module graph: modules with inter-module deps, external coordinates, endpoint counts."""
     conn = _read_conn()
@@ -375,6 +431,7 @@ def get_module_map() -> dict:
 
 
 @mcp.tool()
+@_structured_errors
 def get_change_impact(symbol: str) -> dict:
     """Candidate impact of changing a class, split into direct_impacts (direct
     references) and candidate_impacts (heuristic: endpoints, test names). Each
@@ -389,6 +446,7 @@ def get_change_impact(symbol: str) -> dict:
 
 
 @mcp.tool()
+@_structured_errors
 def generate_context_pack(task: str, max_tokens: int = 8000, max_items: int = 20) -> dict:
     """Explainable, task-scoped context pack: selected_items (each with reason,
     confidence, evidence), excluded_items, a context_markdown and limitations."""

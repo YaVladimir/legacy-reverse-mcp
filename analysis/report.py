@@ -79,7 +79,14 @@ def _inventory(conn) -> dict:
         ),
         "external_clients": (
             _scalar(conn, "SELECT COUNT(DISTINCT class_id) FROM class_annotation WHERE name = '@FeignClient'")
-            + _scalar(conn, "SELECT COUNT(*) FROM field WHERE type_fqn IN ('RestTemplate', 'WebClient')")
+            # the scanner rewrites field types to FQN via the file's imports, so a
+            # normally-imported RestTemplate is stored fully qualified — match the
+            # simple-name suffix, not just the bare name (wildcard-import case)
+            + _scalar(
+                conn,
+                "SELECT COUNT(*) FROM field WHERE type_fqn IN ('RestTemplate', 'WebClient') "
+                "OR type_fqn LIKE '%.RestTemplate' OR type_fqn LIKE '%.WebClient'",
+            )
         ),
         # complementary, config-derived signal (kept separate from the code-based count above)
         "external_service_urls": len(_external_service_url_keys(conn)),

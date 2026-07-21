@@ -31,7 +31,10 @@ _MAX_ENDPOINT_FINDINGS = 25
 
 def _finding(finding_type, subject, summary, confidence, evidence, limitation_codes=()):
     """Build a JSON-able inferred finding (same shape as infer_spring_layer)."""
-    assert evidence, "an inferred finding must carry at least one evidence item"
+    if not evidence:
+        # a real raise, not an assert: `python -O` strips asserts and this is the
+        # main production path for findings — the invariant must survive -O
+        raise ValueError("an inferred finding must carry at least one evidence item")
     return {
         "finding_type": finding_type,
         "subject": subject,
@@ -97,13 +100,17 @@ def _structural_findings(conn, class_id, fqn, simple_name, file_path) -> list[di
     return out
 
 
-def _resolve_class(conn: sqlite3.Connection, name: str) -> sqlite3.Row | None:
+def _resolve_class(conn: sqlite3.Connection, name: str) -> tuple[sqlite3.Row | None, int]:
+    """(row, candidate_count): a simple name matching several classes still
+    resolves to the first, but the caller must SAY so instead of silently
+    explaining one of them."""
     row = conn.execute("SELECT * FROM v_class_full WHERE fqn = ?", (name,)).fetchone()
-    if row is None:
-        row = conn.execute(
-            "SELECT * FROM v_class_full WHERE simple_name = ? ORDER BY fqn LIMIT 1", (name,)
-        ).fetchone()
-    return row
+    if row is not None:
+        return row, 1
+    rows = conn.execute(
+        "SELECT * FROM v_class_full WHERE simple_name = ? ORDER BY fqn LIMIT 5", (name,)
+    ).fetchall()
+    return (rows[0] if rows else None), len(rows)
 
 
 def _suggest_classes(conn: sqlite3.Connection, name: str, limit: int = 5) -> list[dict]:
@@ -123,7 +130,7 @@ def _fact_evidence(facts: list[dict], fact_type: str, subject: str, obj: str | N
 
 
 def explain_class(conn: sqlite3.Connection, name: str) -> dict:
-    cls = _resolve_class(conn, name)
+    cls, candidates = _resolve_class(conn, name)
     if cls is None:
         from analysis.common import not_found
 
@@ -249,7 +256,12 @@ def explain_class(conn: sqlite3.Connection, name: str) -> dict:
         },
         "confidence": conf_str(layer_finding["confidence"]),
         "limitations": limitations(
-            "spring_proxies", "interface_impl_unresolved", "syntactic_calls", "no_call_graph"
+            "spring_proxies", "interface_impl_unresolved", "syntactic_calls",
+            "no_call_graph", "ambiguous_simple_name",
         ),
-        "warnings": [],
+        "warnings": (
+            [f"Simple name {name!r} matches {candidates} classes; explaining "
+             f"{cls['fqn']} — pass the FQN to disambiguate."]
+            if candidates > 1 else []
+        ),
     }
