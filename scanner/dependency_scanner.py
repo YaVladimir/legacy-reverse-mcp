@@ -195,7 +195,16 @@ def parse_maven_module(pom_path: Path) -> ModuleDeps:
             child = el.find(tag)
         return child.text.strip() if child is not None and child.text else None
 
-    for dep in root.iter():
+    # ONLY the project-level <dependencies> block: root.iter() would also sweep
+    # <dependencyManagement> (managed versions, not actual deps), build-plugin
+    # dependencies and profile blocks — a parent pom with 80 managed artifacts
+    # would show 80 phantom external dependencies.
+    deps_el = root.find("m:dependencies", POM_NS)
+    if deps_el is None:
+        deps_el = root.find("dependencies")
+    if deps_el is None:
+        return deps
+    for dep in list(deps_el):
         if not dep.tag.endswith("dependency"):
             continue
         group_id = _find(dep, "groupId")

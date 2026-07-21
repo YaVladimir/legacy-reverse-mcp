@@ -219,7 +219,8 @@ def mcp_repo(tmp_path_factory):
     repo = write_fixture_repo(tmp_path_factory.mktemp("mcp_arch") / "repo")
     mcp_server.scan_repository(str(repo))
     mcp_server.generate_descriptions(no_llm=True)
-    return repo
+    yield repo
+    mcp_server._active_repo = None  # don't leak this repo into other test modules
 
 
 def test_mcp_export_then_import(mcp_repo, tmp_path):

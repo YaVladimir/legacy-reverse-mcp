@@ -207,11 +207,18 @@ def cbmc_call(
             if isinstance(value, bool):
                 argv.extend([f"--{key}", "true" if value else "false"])
                 continue
-            if isinstance(value, (list, tuple)):
-                for item in value:
-                    argv.extend([f"--{key}", str(item)])
-                continue
-            argv.extend([f"--{key}", str(value)])
+            items = value if isinstance(value, (list, tuple)) else [value]
+            for item in items:
+                sval = str(item)
+                # values come from untrusted arch.json (class/pkg names): a value
+                # starting with '-' would be parsed by the CLI as a flag and could
+                # smuggle e.g. a different --project selection
+                if sval.startswith("-"):
+                    return None, {
+                        "tool": tool,
+                        "error": f"unsafe argument value for --{key}: {sval!r}",
+                    }
+                argv.extend([f"--{key}", sval])
     elif args:
         argv.append(str(args))
 

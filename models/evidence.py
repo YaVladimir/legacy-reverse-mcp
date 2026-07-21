@@ -82,6 +82,10 @@ class ObservedFact(BaseModel):
 class InferredFinding(BaseModel):
     """A heuristic conclusion. Must be backed by at least one Evidence item."""
 
+    # re-validate on attribute assignment: without this, `f.evidence = []` after
+    # construction silently bypasses the no-evidence invariant
+    model_config = {"validate_assignment": True}
+
     finding_type: str = Field(..., description="e.g. 'spring_layer', 'endpoint_purpose', 'change_impact'.")
     subject: str
     summary: str

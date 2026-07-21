@@ -58,9 +58,12 @@ def _first_fact(facts: list[dict], fact_type: str) -> dict | None:
 
 
 def _name_layer(simple_name: str) -> tuple[str, str] | None:
+    # canonical implementation naming: WidgetServiceImpl carries the same name
+    # signal as WidgetService (matters for XML-wired legacy with no annotations)
+    base = simple_name[:-4] if simple_name.endswith("Impl") and len(simple_name) > 4 else simple_name
     for suffixes, layer in _NAME_LAYER:
         for suf in suffixes:
-            if simple_name.endswith(suf):
+            if base.endswith(suf):
                 return layer, suf
     return None
 

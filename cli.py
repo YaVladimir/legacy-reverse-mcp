@@ -37,7 +37,11 @@ def scan(repo: str, force: bool, resolve: bool, report: bool) -> None:
     if db_path.exists() and not force:
         click.echo(f"Index already exists at {db_path}, use --force to rebuild.")
         if report:
-            _write_report(get_conn(db_path), repo_path)
+            conn = get_conn(db_path)
+            try:
+                _write_report(conn, repo_path)
+            finally:
+                conn.close()
         return
 
     if db_path.exists() and force:
@@ -45,20 +49,23 @@ def scan(repo: str, force: bool, resolve: bool, report: bool) -> None:
 
     click.echo(f"Scanning {repo_path} ...")
     conn = init_db(db_path)
-    build_index(conn, str(repo_path), progress=click.echo, progress_every=1000)
+    try:
+        build_index(conn, str(repo_path), progress=click.echo, progress_every=1000)
 
-    if resolve:
-        click.echo("Resolving versions via gradle (this can take a while) ...")
-        res = resolve_versions_gradle(conn, str(repo_path), progress=lambda n: None)
-        if res["status"] == "done":
-            click.echo(f"  versions updated: {res['versions_updated']}; failures: {len(res['failures'])}")
-        else:
-            click.echo(f"  resolve skipped: {res.get('reason')}")
+        if resolve:
+            click.echo("Resolving versions via gradle (this can take a while) ...")
+            res = resolve_versions_gradle(conn, str(repo_path), progress=lambda n: None)
+            if res["status"] == "done":
+                click.echo(f"  versions updated: {res['versions_updated']}; failures: {len(res['failures'])}")
+            else:
+                click.echo(f"  resolve skipped: {res.get('reason')}")
 
-    if report:
-        _write_report(conn, repo_path)
-
-    conn.close()
+        if report:
+            _write_report(conn, repo_path)
+    finally:
+        # a failure after the index was written must not leave the WAL connection
+        # open (locked db on Windows, un-checkpointed -wal beside it)
+        conn.close()
     click.echo(f"Index written to {db_path}")
 
 

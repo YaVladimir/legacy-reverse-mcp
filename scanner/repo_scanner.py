@@ -33,7 +33,15 @@ def _relative_parts(path: Path, repo_root: Path | None) -> tuple[str, ...]:
 
 def _is_ignored_path(path: Path, repo_root: Path | None = None) -> bool:
     parts = _relative_parts(path, repo_root)
+    seen_src = False
     for i, part in enumerate(parts):
+        # under a src/ root these names are Java PACKAGE directories (e.g. the
+        # package com.example.build), not build-tool output — never prune them
+        if part == "src":
+            seen_src = True
+            continue
+        if seen_src:
+            continue
         if part in IGNORED_DIRS:
             return True
         allowed_child = _CODEGEN_ALLOWED_CHILD.get(part)
@@ -49,8 +57,13 @@ def prune_dirnames(dirpath: Path, dirnames: list[str], repo_root: Path | None = 
     build-output dir (``build``, ``target``) keep only its codegen child (so
     generated sources are visible, other build output isn't). The build-output
     policy never applies to the repo root itself — a repo *named* ``build`` or
-    ``target`` must not have its own ``src/`` pruned away on the first walk step."""
+    ``target`` must not have its own ``src/`` pruned away on the first walk step —
+    nor to anything under a ``src/`` segment, where ``build``/``target``/``out``
+    are ordinary package directories."""
     is_root = repo_root is not None and Path(dirpath).resolve() == Path(repo_root).resolve()
+    under_src = "src" in _relative_parts(Path(dirpath), repo_root)
+    if under_src:
+        return
     allowed_child = _CODEGEN_ALLOWED_CHILD.get(dirpath.name) if not is_root else None
     if allowed_child is not None:
         dirnames[:] = [d for d in dirnames if d == allowed_child]

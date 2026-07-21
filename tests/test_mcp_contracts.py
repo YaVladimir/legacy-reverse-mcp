@@ -14,7 +14,10 @@ def scanned_repo(tmp_path_factory):
     repo = write_fixture_repo(tmp_path_factory.mktemp("mcp") / "repo")
     res = mcp_server.scan_repository(str(repo))
     assert res["status"] in {"scanned", "exists"}
-    return repo
+    yield repo
+    # scan_repository mutates the process-global active repo — reset it, or a
+    # later test module silently reads THIS repo's index
+    mcp_server._active_repo = None
 
 
 def test_list_endpoints_envelope(scanned_repo):

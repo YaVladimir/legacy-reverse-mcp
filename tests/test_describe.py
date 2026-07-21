@@ -183,7 +183,8 @@ def test_find_feature_bundles_methods(scan_summary_and_conn):
 def scanned_repo(tmp_path_factory, request):
     repo = write_fixture_repo(tmp_path_factory.mktemp("mcp_desc") / "repo")
     mcp_server.scan_repository(str(repo))
-    return repo
+    yield repo
+    mcp_server._active_repo = None  # don't leak this repo into other test modules
 
 
 def test_mcp_generate_descriptions_and_cards(scanned_repo, monkeypatch):

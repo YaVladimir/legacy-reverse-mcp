@@ -398,6 +398,24 @@ def _parse_type_declaration(
         annotations=_collect_annotations(modifiers),
     )
 
+    # record components live in the HEADER, not the class body — without this a
+    # record has zero fields and its component types produce no dependency edges
+    if decl.type == "record_declaration":
+        params = decl.child_by_field_name("parameters")
+        if params is not None:
+            for comp in params.children:
+                if comp.type != "formal_parameter":
+                    continue
+                comp_name = _text(comp.child_by_field_name("name"))
+                if comp_name:
+                    parsed.fields.append(ParsedField(
+                        name=comp_name,
+                        type_fqn=_text(comp.child_by_field_name("type")),
+                        visibility="private",
+                        is_final=True,
+                        line=comp.start_point[0] + 1,
+                    ))
+
     out = [parsed]
     body = _class_body(decl)
     if body is not None:
