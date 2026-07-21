@@ -50,20 +50,27 @@ def _resolve_type_to_class(conn, type_fqn):
 
 
 def _find_impl(conn, row):
-    """If row is an interface, prefer its *Impl implementation."""
+    """If row is an interface, prefer its *Impl implementation.
+
+    Returns ``(resolved_row, ambiguous)``. ``ambiguous`` is True when several
+    implementations exist and none follows the canonical ``<Name>Impl``
+    convention: the returned one is then an arbitrary pick — which impl Spring
+    actually wires (@Primary/@Qualifier) is not indexed — so the caller must
+    degrade the confidence of everything derived from it (weakest link wins),
+    not just attach a limitation."""
     if row is None or row["kind"] != "interface":
-        return row
+        return row, False
     impls = conn.execute(
         "SELECT cl.* FROM class cl JOIN class_interface ci ON ci.class_id = cl.id "
         "WHERE ci.interface_fqn = ?",
         (row["simple_name"],),
     ).fetchall()
     if not impls:
-        return row
+        return row, False
     for impl in impls:
         if impl["simple_name"] == row["simple_name"] + "Impl":
-            return impl
-    return impls[0]
+            return impl, False
+    return impls[0], len(impls) > 1
 
 
 def _looks_like(role_target: str, row) -> bool:
@@ -183,33 +190,54 @@ def trace_endpoint(
     # ---- step 2: service ------------------------------------------------
     service_class = None
     service_method_name = None
+    impl_ambiguous = False
+    warnings: list[str] = []
     step_no = 2
     handler_calls = _calls_of_method(conn, handler_id) if handler_id else []
 
-    for call in handler_calls:
-        target = _resolve_type_to_class(conn, call["receiver_type_fqn"])
-        if target is not None and _looks_like("service", target):
-            service_class = _find_impl(conn, target)
-            service_method_name = call["callee_name"]
-            steps.append(
-                {
-                    "step": step_no,
-                    "kind": "service_call",
-                    "symbol": f"{target['simple_name']}#{call['callee_name']}",
-                    "confidence": "high",  # call found syntactically in the body
-                    "evidence": [
-                        ev(
-                            "method_call",
-                            f"{controller_name}#{handler_name} calls {call['receiver_field']}.{call['callee_name']}()",
-                            file_path=file_path,
-                            line_start=call["line"],
-                            symbol=f"{controller_name}#{handler_name}",
-                        )
-                    ],
-                }
+    # Collect EVERY service-like call before choosing: a handler often calls an
+    # audit/notification service before the business one, and silently tracing
+    # the first call with high confidence would confidently show the wrong chain.
+    service_calls = [
+        (call, target)
+        for call in handler_calls
+        if (target := _resolve_type_to_class(conn, call["receiver_type_fqn"])) is not None
+        and _looks_like("service", target)
+    ]
+    if service_calls:
+        call, target = service_calls[0]
+        not_followed = sorted({
+            f"{t['simple_name']}#{c['callee_name']}" for c, t in service_calls[1:]
+            if t["id"] != target["id"]
+        })
+        service_class, impl_ambiguous = _find_impl(conn, target)
+        service_method_name = call["callee_name"]
+        steps.append(
+            {
+                "step": step_no,
+                "kind": "service_call",
+                "symbol": f"{target['simple_name']}#{call['callee_name']}",
+                # a syntactic call is high — unless other service calls exist and
+                # "first by line" is just a guess at which one is the business flow
+                "confidence": "medium" if not_followed else "high",
+                "evidence": [
+                    ev(
+                        "method_call",
+                        f"{controller_name}#{handler_name} calls {call['receiver_field']}.{call['callee_name']}()",
+                        file_path=file_path,
+                        line_start=call["line"],
+                        symbol=f"{controller_name}#{handler_name}",
+                    )
+                ],
+            }
+        )
+        step_no += 1
+        if not_followed:
+            warnings.append(
+                f"{controller_name}#{handler_name} calls {len(service_calls)} service-like beans; "
+                f"the trace follows {target['simple_name']}#{call['callee_name']} (first by line). "
+                f"Not followed: {', '.join(not_followed)}."
             )
-            step_no += 1
-            break
 
     if service_class is None and controller_id is not None and handler_id is not None:
         # same-class hop: the handler delegates to a helper in this controller that
@@ -242,7 +270,7 @@ def trace_endpoint(
                     }
                 )
                 step_no += 1
-                service_class = _find_impl(conn, target)
+                service_class, impl_ambiguous = _find_impl(conn, target)
                 service_method_name = inner["callee_name"]
                 steps.append(
                     {
@@ -271,7 +299,7 @@ def trace_endpoint(
         for fld in _injected_of(conn, controller_id):
             target = _resolve_type_to_class(conn, fld["type_fqn"])
             if target is not None and _looks_like("service", target):
-                service_class = _find_impl(conn, target)
+                service_class, impl_ambiguous = _find_impl(conn, target)
                 steps.append(
                     {
                         "step": step_no,
@@ -295,6 +323,14 @@ def trace_endpoint(
     if service_class is not None:
         svc_file = service_class["file_path"]
         svc_name = service_class["simple_name"]
+        if impl_ambiguous:
+            warnings.append(
+                f"{svc_name} is one of several implementations of the called interface; "
+                "which one Spring actually wires (@Primary/@Qualifier) is not indexed — "
+                "downstream steps are derived from an arbitrary candidate."
+            )
+        # weakest link: steps derived from an arbitrarily-picked impl cannot be high
+        impl_conf = "medium" if impl_ambiguous else "high"
         svc_method = (
             _method_in_class(conn, service_class["id"], service_method_name)
             if service_method_name
@@ -306,7 +342,10 @@ def trace_endpoint(
             for call in _calls_of_method(conn, svc_method["id"]):
                 simple = _simple_type(call["receiver_type_fqn"])
                 if simple in _PERSISTENCE_TYPES:
-                    steps.append(_persistence_step(step_no, simple, svc_name, svc_method["name"], call, svc_file))
+                    steps.append(_persistence_step(
+                        step_no, simple, svc_name, svc_method["name"], call, svc_file,
+                        confidence=impl_conf,
+                    ))
                     step_no += 1
                     added = True
                     break
@@ -317,7 +356,7 @@ def trace_endpoint(
                             "step": step_no,
                             "kind": "repository_call",
                             "symbol": f"{target['simple_name']}#{call['callee_name']}",
-                            "confidence": "high",
+                            "confidence": impl_conf,
                             "evidence": [
                                 ev(
                                     "method_call",
@@ -369,12 +408,20 @@ def trace_endpoint(
                     step_no += 1
                     break
 
+    # a trace that found a service but no repository/persistence step is
+    # indistinguishable from a complete two-layer flow unless we say so —
+    # unresolved hand-written ctor injection is a known cause of exactly this
+    if service_class is not None and steps[-1]["kind"] in ("service_call", "likely_service"):
+        warnings.append(
+            f"No repository/persistence call could be resolved from {service_class['simple_name']} — "
+            "the trace may be incomplete, not necessarily two-layered."
+        )
+
     # ---- overall confidence --------------------------------------------
     non_ctrl = steps[1:]
     if not non_ctrl:
         overall = "low"
-    elif all(s["confidence"] == "high" for s in steps):
-        overall = "high"
+        warnings.append("No downstream service/repository call could be resolved from this controller method.")
     else:
         overall = conf_str(min_confidence([s["confidence"] for s in steps]))
 
@@ -383,17 +430,20 @@ def trace_endpoint(
         "endpoint": endpoint_block,
         "trace": steps,
         "confidence": overall,
-        "limitations": limitations("syntactic_calls", "spring_proxies", "interface_impl_unresolved", "no_call_graph"),
-        "warnings": [] if non_ctrl else ["No downstream service/repository call could be resolved from this controller method."],
+        "limitations": limitations(
+            "syntactic_calls", "spring_proxies", "interface_impl_unresolved",
+            "no_call_graph", "ctor_injection_without_lombok",
+        ),
+        "warnings": warnings,
     }
 
 
-def _persistence_step(step_no, simple, svc_name, svc_method, call, svc_file) -> dict:
+def _persistence_step(step_no, simple, svc_name, svc_method, call, svc_file, *, confidence="high") -> dict:
     return {
         "step": step_no,
         "kind": "persistence",
         "symbol": f"{simple}#{call['callee_name']}",
-        "confidence": "high",
+        "confidence": confidence,
         "evidence": [
             ev(
                 "method_call",
