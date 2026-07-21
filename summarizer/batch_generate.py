@@ -619,7 +619,7 @@ def _run_single_chunk(
         cmd=gigacode_cmd, args=gigacode_args, prompt=prompt,
         output="stdout", timeout=timeout, cwd=cwd,
     )
-    argv, err = _build_argv(config)
+    argv, stdin_text, err = _build_argv(config)
     if argv is None:
         return chunk_idx, None, {"error": err}
 
@@ -629,7 +629,8 @@ def _run_single_chunk(
         info["cbmc_total"] = len(chunk_classes or [])
     try:
         proc = subprocess.run(
-            argv, capture_output=True, text=True, encoding="utf-8", errors="replace",
+            argv, input=stdin_text, capture_output=True, text=True,
+            encoding="utf-8", errors="replace",
             timeout=config.timeout, cwd=config.cwd,
         )
     except subprocess.TimeoutExpired:
@@ -787,6 +788,21 @@ def main(argv: list[str] | None = None) -> None:  # noqa: C901 - linear orchestr
             for f in rs_dir.glob("chunk-*-stdout.txt"):
                 shutil.copy2(f, work_dir / f.name)
         print(f"Resume mode: working directory = {work_dir}")
+    elif not args.merge_only:
+        # Fresh run: clear leftovers of a previous generation. A re-generated
+        # arch.json usually produces fewer/differently-sliced chunks; stale
+        # higher-numbered chunk files and their sidecars would otherwise be
+        # picked up by a later --resume as "already succeeded" and stale
+        # descriptions would be imported with a fresh structure hash.
+        stale = [
+            f for pattern in ("chunk-*.json", "out-chunk-*.json",
+                              "chunk-*-stdout.txt", "chunk-*-stdout.err.txt")
+            for f in work_dir.glob(pattern)
+        ]
+        for f in stale:
+            f.unlink()
+        if stale:
+            print(f"Cleared {len(stale)} stale file(s) from a previous run in {work_dir}")
 
     # 4. gigacode config ------------------------------------------------------
     gigacode_cmd = args.gigacode_cmd or os.environ.get("LEGACY_REVERSE_GIGACODE_CMD", "gigacode")

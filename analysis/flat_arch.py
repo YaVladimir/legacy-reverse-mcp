@@ -205,9 +205,15 @@ def _resolve_class_row(conn: sqlite3.Connection, entry: dict) -> sqlite3.Row | N
         if row is not None:
             return row
     if name:
-        return conn.execute(
-            "SELECT id, fqn FROM class WHERE simple_name = ? ORDER BY fqn LIMIT 1", (name,)
-        ).fetchone()
+        # last-resort fallback: only trust a UNIQUE simple name. Silently picking
+        # the first of several same-named classes would write the description to
+        # the wrong class AND persist it in the durable imported store under the
+        # wrong fqn (surviving even scan --force).
+        rows = conn.execute(
+            "SELECT id, fqn FROM class WHERE simple_name = ? ORDER BY fqn LIMIT 2", (name,)
+        ).fetchall()
+        if len(rows) == 1:
+            return rows[0]
     return None
 
 

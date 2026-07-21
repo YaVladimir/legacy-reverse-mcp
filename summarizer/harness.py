@@ -15,6 +15,8 @@ location are only known on the work machine:
     LEGACY_REVERSE_GIGACODE_OUTPUT   default: stdout      (or a path to the JSON the skill writes)
     LEGACY_REVERSE_GIGACODE_TIMEOUT  default: 900         (seconds)
     LEGACY_REVERSE_GIGACODE_CWD      default: the repo    (so the skill sees the project)
+    LEGACY_REVERSE_GIGACODE_STDIN    "1": pipe the prompt via stdin instead of argv
+                                     (required for .cmd/.bat shims, see _build_argv)
 
 If gigacode is not installed, the manual path still works: run the skill yourself,
 then ``legacy-reverse import-arch --in <file>``.
@@ -39,6 +41,10 @@ _DEFAULT_PROMPT = (
 )
 
 
+def _stdin_from_env() -> bool:
+    return os.environ.get("LEGACY_REVERSE_GIGACODE_STDIN") == "1"
+
+
 @dataclass
 class HarnessConfig:
     cmd: str = "gigacode"
@@ -47,6 +53,8 @@ class HarnessConfig:
     output: str = "stdout"          # "stdout" or a path to a JSON file the skill writes
     timeout: float = 900.0
     cwd: str | None = None
+    # pipe the prompt via stdin instead of appending it to argv (see _build_argv)
+    prompt_stdin: bool = field(default_factory=_stdin_from_env)
 
     @classmethod
     def from_env(cls, repo_path: str | None = None) -> "HarnessConfig":
@@ -89,24 +97,44 @@ def _extract_json(text: str) -> dict | None:
     return obj if isinstance(obj, dict) else None
 
 
-def _build_argv(cfg: HarnessConfig) -> tuple[list[str] | None, str | None]:
+def _build_argv(cfg: HarnessConfig) -> tuple[list[str] | None, str | None, str | None]:
+    """Return (argv, stdin_text, error).
+
+    The prompt normally travels as the last argv element. A .cmd/.bat shim on
+    Windows can only be launched through ``cmd /c`` — but cmd.exe does not honor
+    the MSVCRT quoting subprocess applies to argv: quotes, ``&``/``|`` and
+    newlines inside the prompt get re-parsed as shell syntax. Since the prompt
+    embeds content from the analyzed repo (raw source in --use-cbmc mode), that
+    would be command injection from repo content — and any multi-line prompt
+    breaks outright. So a shim is refused unless ``prompt_stdin`` is set
+    (LEGACY_REVERSE_GIGACODE_STDIN=1), in which case the prompt is piped via
+    stdin and argv carries only the fixed, trusted flags."""
     exe = shutil.which(cfg.cmd) or cfg.cmd
     if shutil.which(cfg.cmd) is None and not (
         os.environ.get("GIGACODE") or os.environ.get("GIGACODE_CLI")
     ):
-        return None, f"'{cfg.cmd}' not found on PATH"
-    argv = [exe, *cfg.args, cfg.prompt]
-    # Windows: a .cmd/.bat shim cannot be launched directly by CreateProcess.
-    if os.name == "nt" and exe.lower().endswith((".cmd", ".bat")):
-        argv = ["cmd", "/c", *argv]
-    return argv, None
+        return None, None, f"'{cfg.cmd}' not found on PATH"
+    is_shim = os.name == "nt" and exe.lower().endswith((".cmd", ".bat"))
+    if cfg.prompt_stdin:
+        argv = [exe, *cfg.args]
+        if is_shim:
+            argv = ["cmd", "/c", *argv]
+        return argv, cfg.prompt, None
+    if is_shim:
+        return None, None, (
+            f"'{exe}' is a .cmd/.bat shim: it needs cmd /c, and cmd.exe would "
+            "re-parse prompt content as shell syntax (command injection risk). "
+            "Point LEGACY_REVERSE_GIGACODE_CMD at the real executable, or set "
+            "LEGACY_REVERSE_GIGACODE_STDIN=1 to pass the prompt via stdin."
+        )
+    return [exe, *cfg.args, cfg.prompt], None, None
 
 
 def run_gigacode(repo_path: str, cfg: HarnessConfig | None = None) -> tuple[dict | None, dict]:
     """Run the configured gigacode command and return (flat_json_or_None, info)."""
     cfg = cfg or HarnessConfig.from_env(repo_path)
     info: dict = {"cmd": cfg.cmd, "output": cfg.output}
-    argv, err = _build_argv(cfg)
+    argv, stdin_text, err = _build_argv(cfg)
     if argv is None:
         info["error"] = err
         info["hint"] = (
@@ -118,6 +146,7 @@ def run_gigacode(repo_path: str, cfg: HarnessConfig | None = None) -> tuple[dict
     try:
         proc = subprocess.run(
             argv,
+            input=stdin_text,
             capture_output=True,
             text=True,
             encoding="utf-8",
