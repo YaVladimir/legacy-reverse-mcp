@@ -23,9 +23,10 @@ import json
 import os
 import re
 import shutil
-import subprocess
 from pathlib import Path
 from typing import Any
+
+from utils.proc import run_tree_captured
 
 _TOML_CBMC_RE = re.compile(r"^\[cbmc\]", re.MULTILINE)
 _ENV_RE = re.compile(r"^(\w[\w\d_]*)\s*=\s*(.+)$", re.MULTILINE)
@@ -214,19 +215,14 @@ def cbmc_call(
     elif args:
         argv.append(str(args))
 
-    try:
-        proc = subprocess.run(
-            argv,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=timeout,
-        )
-    except subprocess.TimeoutExpired:
-        return None, {"tool": tool, "binary": bin_path, "exit_code": -1, "error": f"timeout after {timeout:.0f}s"}
-    except OSError as exc:
-        return None, {"tool": tool, "binary": bin_path, "error": str(exc)}
+    # run_tree_captured kills the WHOLE process tree on timeout — the binary may
+    # spawn workers, and an orphan holding the pipe would hang the caller forever
+    proc = run_tree_captured(argv, timeout=timeout)
+    if proc.error is not None:
+        if proc.error.startswith("timed out"):
+            return None, {"tool": tool, "binary": bin_path, "exit_code": -1,
+                          "error": f"timeout after {timeout:.0f}s"}
+        return None, {"tool": tool, "binary": bin_path, "error": proc.error}
 
     info = {"tool": tool, "binary": bin_path, "exit_code": proc.returncode}
 

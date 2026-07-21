@@ -66,13 +66,17 @@ def _iter_java_files(repo_root: Path, skip_tests: bool):
     for dirpath, dirnames, filenames in os.walk(repo_root):
         prune_dirnames(Path(dirpath), dirnames, repo_root)
         if skip_tests:
-            parts = Path(dirpath).parts
-            # skip standard test source roots: .../src/test/...
-            if "src" in parts:
-                i = parts.index("src")
-                if i + 1 < len(parts) and parts[i + 1] in ("test", "integrationTest"):
-                    dirnames[:] = []
-                    continue
+            # match src/test|integrationTest against the REPO-RELATIVE path: the
+            # absolute path may itself contain .../src/... segments (a repo cloned
+            # under C:\src\test\myrepo would otherwise scan as empty, and a repo
+            # under ~/src/... would keep its real test sources)
+            rel_parts = Path(os.path.relpath(dirpath, repo_root)).parts
+            if any(
+                rel_parts[i] == "src" and rel_parts[i + 1] in ("test", "integrationTest")
+                for i in range(len(rel_parts) - 1)
+            ):
+                dirnames[:] = []
+                continue
         for name in filenames:
             if name.endswith(".java"):
                 candidate = Path(dirpath) / name
@@ -107,7 +111,14 @@ def _resolve_types_inplace(pc: ParsedClass, imap: dict[str, str]) -> None:
         if not t:
             return t
         simple = _simple_type(t)
-        return imap.get(simple, t) if simple else t
+        fqn = imap.get(simple) if simple else None
+        if not fqn:
+            return t
+        # replace only the base identifier, KEEPING generic arguments — rewriting
+        # List<PaymentValidator> to bare java.util.List would destroy the only
+        # record of the injected element type (see _type_refs)
+        lt = t.find("<")
+        return fqn + t[lt:] if lt >= 0 else fqn
 
     pc.superclass_fqn = r(pc.superclass_fqn)
     for f in pc.fields:
@@ -383,6 +394,47 @@ def resolve_same_package_types(conn) -> int:
     return resolved
 
 
+def _type_refs(t: str) -> list[str]:
+    """A written type plus its top-level generic arguments, recursively.
+
+    ``List<PaymentValidator>`` references BOTH java.util.List and
+    PaymentValidator — the collection-injection idiom (@Autowired
+    List<Validator>) must produce a dependency edge on the element type, or
+    change-impact silently misses every collection-injected dependent."""
+    out = [t]
+    lt = t.find("<")
+    if lt < 0 or ">" not in t:
+        return out
+    inner = t[lt + 1 : t.rfind(">")]
+    depth = 0
+    buf = ""
+    parts: list[str] = []
+    for ch in inner:
+        if ch == "<":
+            depth += 1
+        elif ch == ">":
+            depth -= 1
+        elif ch == "," and depth == 0:
+            parts.append(buf)
+            buf = ""
+            continue
+        buf += ch
+    if buf.strip():
+        parts.append(buf)
+    for raw in parts:
+        arg = raw.strip()
+        # wildcards: '?' alone carries no type; '? extends X' / '? super X' -> X
+        if arg.startswith("?"):
+            arg = arg.lstrip("?").strip()
+            for kw in ("extends", "super"):
+                if arg.startswith(kw):
+                    arg = arg[len(kw):].strip()
+                    break
+        if arg:
+            out.extend(_type_refs(arg))
+    return out
+
+
 def index_class_dependencies(conn) -> int:
     """Post-pass: derive intra-project class->class edges from already-indexed data.
 
@@ -404,7 +456,8 @@ def index_class_dependencies(conn) -> int:
     refs: dict[int, list[tuple[str | None, str]]] = {}
 
     def add(cid, ref, kind):
-        refs.setdefault(cid, []).append((ref, kind))
+        for sub in (_type_refs(ref) if ref else [ref]):
+            refs.setdefault(cid, []).append((sub, kind))
 
     for r in conn.execute("SELECT id, superclass_fqn FROM class WHERE superclass_fqn IS NOT NULL"):
         add(r["id"], r["superclass_fqn"], "inheritance")

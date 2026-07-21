@@ -31,7 +31,6 @@ import json
 import os
 import re
 import shutil
-import subprocess
 import sys
 import threading
 import time
@@ -42,6 +41,7 @@ from typing import Any
 from analysis.flat_arch import import_flat
 from index.repository import get_conn
 from summarizer.harness import HarnessConfig, _build_argv, _extract_json, gigacode_available
+from utils.proc import run_tree_captured
 from utils.cbmc_config import (
     cbmc_available,
     cbmc_call,
@@ -627,17 +627,11 @@ def _run_single_chunk(
     if grounded is not None:
         info["cbmc_grounded"] = grounded
         info["cbmc_total"] = len(chunk_classes or [])
-    try:
-        proc = subprocess.run(
-            argv, input=stdin_text, capture_output=True, text=True,
-            encoding="utf-8", errors="replace",
-            timeout=config.timeout, cwd=config.cwd,
-        )
-    except subprocess.TimeoutExpired:
-        info["error"] = f"gigacode timed out after {config.timeout:.0f}s"
-        return chunk_idx, None, info
-    except OSError as exc:
-        info["error"] = f"failed to run gigacode: {exc}"
+    proc = run_tree_captured(
+        argv, timeout=config.timeout, cwd=config.cwd, input_text=stdin_text,
+    )
+    if proc.error is not None:
+        info["error"] = f"gigacode {proc.error}"
         return chunk_idx, None, info
 
     info["returncode"] = proc.returncode

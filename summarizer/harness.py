@@ -28,11 +28,11 @@ import json
 import os
 import shutil
 import sqlite3
-import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from analysis.flat_arch import import_flat
+from utils.proc import run_tree_captured
 
 _DEFAULT_PROMPT = (
     "Запусти скилл architecture-generator для проекта в текущем каталоге и верни "
@@ -143,23 +143,15 @@ def run_gigacode(repo_path: str, cfg: HarnessConfig | None = None) -> tuple[dict
         )
         return None, info
 
-    try:
-        proc = subprocess.run(
-            argv,
-            input=stdin_text,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=cfg.timeout,
-            cwd=cfg.cwd or repo_path,
-            env=os.environ.copy(),
-        )
-    except subprocess.TimeoutExpired:
-        info["error"] = f"gigacode timed out after {cfg.timeout:.0f}s"
-        return None, info
-    except OSError as exc:
-        info["error"] = f"failed to run gigacode: {exc}"
+    proc = run_tree_captured(
+        argv,
+        timeout=cfg.timeout,
+        cwd=cfg.cwd or repo_path,
+        input_text=stdin_text,
+        env=os.environ.copy(),
+    )
+    if proc.error is not None:
+        info["error"] = f"gigacode {proc.error}"
         return None, info
 
     info["returncode"] = proc.returncode

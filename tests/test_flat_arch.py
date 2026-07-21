@@ -187,8 +187,10 @@ def test_harness_imports_fake_gigacode_output(tmp_path, monkeypatch):
     }
     monkeypatch.setattr(harness.shutil, "which", lambda c: r"C:\fake\gigacode.exe")
     monkeypatch.setattr(
-        harness.subprocess, "run",
-        lambda argv, **kw: types.SimpleNamespace(returncode=0, stdout=json.dumps(flat), stderr=""),
+        harness, "run_tree_captured",
+        lambda argv, **kw: types.SimpleNamespace(
+            returncode=0, stdout=json.dumps(flat), stderr="", error=None
+        ),
     )
     stats = harness.generate_architecture(conn, str(repo))
     assert stats["status"] == "imported"

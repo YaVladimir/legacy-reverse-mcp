@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import json
 import os
-import subprocess
 from types import SimpleNamespace
 
 import pytest
@@ -139,10 +138,10 @@ def fake_run(monkeypatch, tmp_path):
 
     def run(argv, **kwargs):
         state["argv"] = argv
-        return SimpleNamespace(returncode=state["returncode"],
-                               stdout=state["stdout"], stderr=state["stderr"])
+        return SimpleNamespace(returncode=state["returncode"], stdout=state["stdout"],
+                               stderr=state["stderr"], error=state.get("error"))
 
-    monkeypatch.setattr(subprocess, "run", run)
+    monkeypatch.setattr(cc, "run_tree_captured", run)
     return state
 
 
