@@ -3,8 +3,8 @@
 These are unit tests over the seams — no subprocess, no live binary. They pin the
 three behaviours that make the integration safe: (1) the enriched prompt inlines
 real code for grounded classes and degrades *per class* to the signature for the
-rest (never all-or-nothing); (2) project resolution prefers an explicit config over
-fuzzy guessing and refuses ambiguous matches; (3) a per-class fetch failure is
+rest (never all-or-nothing); (2) project resolution prefers an explicit config or
+an exact indexed root over guessing; (3) a per-class fetch failure is
 logged, not silently swallowed, and simply drops that class from the context."""
 
 from __future__ import annotations
@@ -21,9 +21,16 @@ _CLASSES = [
 ]
 
 
-def _snippet(source, callers=(), callees=()):
+def _snippet(
+    source, qn="com.example.app.OrderService", callers=(), callees=()
+):
     # real binary response shape: caller_names/callee_names are plain string arrays
-    return {"source": source, "caller_names": list(callers), "callee_names": list(callees)}
+    return {
+        "source": source,
+        "qualified_name": qn,
+        "caller_names": list(callers),
+        "callee_names": list(callees),
+    }
 
 
 # --- prompt: grounded inline + per-class signature degradation ---------------
@@ -84,7 +91,7 @@ def test_fetch_class_code_falls_back_to_class_label_search(monkeypatch):
         if qn == "com.example.app.OrderService":
             return None, {"error": "not found"}
         assert qn == "proj.src.com.example.app.OrderService"  # canonical graph QN
-        return _snippet("SRC2"), {}
+        return _snippet("SRC2", qn=qn), {}
 
     def fake_call(tool, args, binary=None, timeout=300.0, repo_path=None):
         calls["tool"], calls["args"], calls["timeout"] = tool, args, timeout
@@ -110,7 +117,7 @@ def test_fetch_class_code_fallback_filters_foreign_package(monkeypatch):
         if qn == "com.example.app.OrderService":
             return None, {"error": "not found"}
         assert qn == "proj.src.com.example.app.OrderService"  # never the foreign one
-        return _snippet("RIGHT"), {}
+        return _snippet("RIGHT", qn=qn), {}
 
     def fake_call(tool, args, binary=None, timeout=300.0, repo_path=None):
         return {"results": [
@@ -137,6 +144,43 @@ def test_fetch_class_code_fallback_refuses_ambiguity_without_pkg(monkeypatch, ca
     assert "ambiguous graph match" in capsys.readouterr().out
 
 
+def test_fetch_class_code_refuses_case_mismatched_fqn(monkeypatch, capsys):
+    """Java packages are case-sensitive; a case-only neighbour is still foreign code.
+
+    The fork's direct suffix lookup uses SQLite LIKE, which is ASCII-case-insensitive
+    by default, so the client must verify the qualified_name in every response."""
+    wrong_qn = "proj.src.com.Example.app.OrderService"
+    monkeypatch.setattr(
+        bg, "cbmc_get_code_snippet",
+        lambda *a, **k: (_snippet("WRONG", qn=wrong_qn), {}),
+    )
+    monkeypatch.setattr(bg, "cbmc_call", lambda *a, **k: ({"results": [
+        {"qualified_name": wrong_qn, "label": "Class"},
+    ]}, {}))
+
+    assert bg._fetch_class_code(_CLASSES[0], "proj", None, 30.0) is None
+    output = capsys.readouterr().out
+    assert "foreign qualified_name" in output
+    assert wrong_qn in output
+
+
+def test_fetch_class_code_logs_normal_subprocess_errors(monkeypatch, capsys):
+    """Timeout/nonzero-exit errors arrive in info dicts, not as exceptions."""
+    monkeypatch.setattr(
+        bg, "cbmc_get_code_snippet",
+        lambda *a, **k: (None, {"error": "timeout after 30s"}),
+    )
+    monkeypatch.setattr(
+        bg, "cbmc_call",
+        lambda *a, **k: (None, {"error": "search process exited 2"}),
+    )
+
+    assert bg._fetch_class_code(_CLASSES[0], "proj", None, 30.0) is None
+    output = capsys.readouterr().out
+    assert "timeout after 30s" in output
+    assert "search process exited 2" in output
+
+
 def test_fetch_chunk_context_logs_failure_not_swallow(monkeypatch, capsys):
     def flaky(cls, project, binary, timeout):
         if cls["name"] == "Money":
@@ -158,7 +202,17 @@ def test_resolve_project_prefers_explicit_config(monkeypatch):
     assert called["list"] is False  # never needed to guess
 
 
-def test_resolve_project_exact_path_match(monkeypatch, tmp_path):
+def test_resolve_project_exact_root_path_match(monkeypatch, tmp_path):
+    repo = tmp_path / "myrepo"
+    repo.mkdir()
+    monkeypatch.setattr(bg, "cbmc_list_projects", lambda *a, **k: ([{
+        "name": "indexed-under-any-name", "root_path": str(repo.resolve()),
+    }], {}))
+    assert bg._resolve_cbmc_project(str(repo)) == "indexed-under-any-name"
+
+
+def test_resolve_project_legacy_index_uses_exact_derived_name(monkeypatch, tmp_path):
+    """Old list_projects responses without root_path retain an exact-name fallback."""
     repo = tmp_path / "myrepo"
     repo.mkdir()
     expected = bg._derive_cbmc_project_name(repo)
@@ -190,17 +244,24 @@ def test_cbmc_name_map_posix_windows_and_nonascii():
     assert bg._cbmc_name_map("/tmp/пример") == "tmp-d0bfd180d0b8d0bcd0b5d180"
     # spaces are unsafe too (fqn.c #349: "my project" must not keep the space)
     assert bg._cbmc_name_map("/home/u/my project") == "home-u-my-project"
+    # fqn_bound_name_len: 191-byte prefix + '-' + 8-char FNV-1a hash
+    assert bg._cbmc_name_map("a" * 201) == "a" * 191 + "-876056a4"
+    assert len(bg._cbmc_name_map("a" * 201)) == 200
 
 
-def test_resolve_project_refuses_ambiguous(monkeypatch, tmp_path, capsys):
+def test_resolve_project_refuses_unique_substring_of_foreign_root(monkeypatch, tmp_path, capsys):
+    """A repo directory name must not act as a selector for somebody else's index."""
     repo = tmp_path / "svc"
     repo.mkdir()
+    foreign = tmp_path / "elsewhere" / "svc-production"
     monkeypatch.setattr(
         bg, "cbmc_list_projects",
-        lambda *a, **k: ([{"name": "a-svc-1"}, {"name": "b-svc-2"}], {}),
+        lambda *a, **k: ([{
+            "name": "company-svc-production", "root_path": str(foreign),
+        }], {}),
     )
     assert bg._resolve_cbmc_project(str(repo)) is None
-    assert "ambiguous project" in capsys.readouterr().out
+    assert "no indexed project rooted" in capsys.readouterr().out
 
 
 def test_resolve_project_passes_explicit_binary(monkeypatch, tmp_path):
@@ -213,7 +274,7 @@ def test_resolve_project_passes_explicit_binary(monkeypatch, tmp_path):
 
     def fake_list(binary=None):
         seen["binary"] = binary
-        return [{"name": repo.resolve().as_posix().replace("/", "-")}], {}
+        return [{"name": "custom-project", "root_path": str(repo.resolve())}], {}
 
     monkeypatch.setattr(bg, "cbmc_list_projects", fake_list)
     assert bg._resolve_cbmc_project(str(repo), binary="/opt/custom/cbmc") is not None
@@ -229,10 +290,10 @@ def test_resolve_project_env_var_wins(monkeypatch):
 
 # --- _setup_cbmc: --cbmc-bin must not lose toml project pinning --------------
 
-def test_setup_cbmc_explicit_bin_keeps_toml_project(monkeypatch):
-    """--cbmc-bin overrides the binary but must NOT discard the toml [cbmc] project —
-    losing it silently drops project resolution to the substring heuristic (the old
-    code passed an empty config dict whenever --cbmc-bin was given)."""
+def test_setup_cbmc_explicit_bin_keeps_trusted_toml_project(monkeypatch):
+    """--cbmc-bin overrides the binary but must NOT discard a trusted toml project —
+    older indexes may not expose root_path for automatic resolution (the old code
+    passed an empty config dict whenever --cbmc-bin was given)."""
     monkeypatch.delenv("LEGACY_REVERSE_CBMC_PROJECT", raising=False)
     monkeypatch.setattr(bg, "resolve_cbmc_config",
                         lambda repo: ("/resolved/bin", {"project": "pinned-proj"}))

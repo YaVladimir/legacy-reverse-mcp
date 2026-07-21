@@ -200,13 +200,18 @@ def compute_low_confidence_findings(conn, limit: int = 25) -> list[InferredFindi
     ):
         nm = _name_layer(r["simple_name"])
         pk = _pkg_layer(r["pkg"])
+        # Mirror infer_spring_layer: a data carrier cannot be a behavioural bean,
+        # but a weaker non-component hint may still be valid. For example,
+        # OrderService in a *.dto package should retain the DTO package hint after
+        # its misleading service-like name is discarded.
+        if r["kind"] in _DATA_CARRIER_KINDS:
+            if nm and nm[0] in _COMPONENT_LAYERS:
+                nm = None
+            if pk and pk[0] in _COMPONENT_LAYERS:
+                pk = None
         if not (nm or pk):
             continue
         layer = (nm or pk)[0]
-        # B3: a data carrier (record/enum/annotation) is never a behavioural bean —
-        # don't guess a component layer for it (kills "value record -> possibly a service").
-        if r["kind"] in _DATA_CARRIER_KINDS and layer in _COMPONENT_LAYERS:
-            continue
         # B4: a contract interface whose endpoints were all reattributed to a concrete
         # controller is already resolved — don't re-surface it as "possibly a controller"
         # (the openapi-generated *Api interfaces).

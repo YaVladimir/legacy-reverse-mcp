@@ -6,8 +6,8 @@ AttributeError on the first ``KEY=VALUE`` line of any ``.env``. These tests pin
 the three seams the batch pipeline depends on: (1) the .env loader actually
 loads; (2) binary resolution honors the trust boundary — a repo-supplied
 ``binary_path``/.env names an executable and must be opt-in via
-LEGACY_REVERSE_TRUST_REPO_CONFIG=1, while ``[cbmc] project`` (plain data)
-survives every resolution branch; (3) ``cbmc_call`` builds argv correctly and
+LEGACY_REVERSE_TRUST_REPO_CONFIG=1; the ``[cbmc] project`` source selector is
+subject to the same boundary; (3) ``cbmc_call`` builds typed argv correctly and
 parses both single-line and pretty-printed JSON output."""
 
 from __future__ import annotations
@@ -68,12 +68,13 @@ def _write_toml(repo, body):
     (repo / "legacy-reverse.toml").write_text(body, encoding="utf-8")
 
 
-def test_resolve_env_var_wins_and_keeps_toml_project(tmp_path, env):
+def test_resolve_env_var_wins_and_keeps_trusted_toml_project(tmp_path, env):
     _write_toml(tmp_path, '[cbmc]\nproject = "pinned"\nbinary_path = "/repo/evil"\n')
     env["LEGACY_REVERSE_CBMC_BIN"] = "/usr/bin/cbmc"
+    env["LEGACY_REVERSE_TRUST_REPO_CONFIG"] = "1"
     binary, cfg = cc.resolve_cbmc_config(tmp_path)
     assert binary == "/usr/bin/cbmc"
-    # project pinning is plain data and must survive every branch
+    # A trusted project pin survives every binary-resolution branch.
     assert cfg.get("project") == "pinned"
 
 
@@ -90,8 +91,21 @@ def test_resolve_repo_toml_binary_ignored_without_trust(tmp_path, env, capsys):
     binary, cfg = cc.resolve_cbmc_config(tmp_path)
     assert binary != "/repo/evil"
     assert binary == cc._default_binary_path()
-    assert "LEGACY_REVERSE_TRUST_REPO_CONFIG" in capsys.readouterr().out
-    assert cfg.get("project") == "pinned"  # data still read
+    output = capsys.readouterr().out
+    assert "binary_path" in output
+    assert "project" in output
+    assert "LEGACY_REVERSE_TRUST_REPO_CONFIG" in output
+    assert "project" not in cfg
+    assert "binary_path" not in cfg
+
+
+def test_resolve_repo_project_ignored_without_trust(tmp_path, env, capsys):
+    """A repo project pin can select and expose another local CBMC source index."""
+    _write_toml(tmp_path, '[cbmc]\nproject = "other-local-project"\n')
+    binary, cfg = cc.resolve_cbmc_config(tmp_path)
+    assert binary == cc._default_binary_path()
+    assert "project" not in cfg
+    assert "source selector" in capsys.readouterr().out
 
 
 def test_resolve_repo_toml_binary_honored_with_trust(tmp_path, env):
@@ -141,9 +155,22 @@ def test_cbmc_call_argv_dict_and_bools(fake_run):
     assert result == {}
     argv = fake_run["argv"]
     assert argv[1:3] == ["cli", "search_graph"]
-    assert argv[3:] == ["--project", "p", "--limit", "5", "--flag_on", "true"]
-    assert "--flag_off" not in argv  # False → flag absent, not "--flag_off ''"
+    assert argv[3:] == [
+        "--project", "p", "--limit", "5", "--flag_on", "true", "--flag_off", "false",
+    ]
     assert "" not in argv
+
+
+def test_cbmc_call_repeats_array_flags(fake_run):
+    result, _ = cc.cbmc_call(
+        "get_architecture",
+        {"project": "p", "aspects": ["layers", "clusters"]},
+        binary=fake_run["binary"],
+    )
+    assert result == {}
+    assert fake_run["argv"][3:] == [
+        "--project", "p", "--aspects", "layers", "--aspects", "clusters",
+    ]
 
 
 def test_cbmc_call_parses_pretty_printed_json_after_warnings(fake_run):

@@ -55,6 +55,24 @@ def test_value_record_in_service_pkg_is_not_flagged_as_service(tmp_path):
         conn.close()
 
 
+def test_data_carrier_keeps_non_component_package_hint(tmp_path):
+    conn = _scan(tmp_path / "repo", {
+        "pom.xml": _POM,
+        # The name is misleading for a record, but the package still provides a
+        # valid DTO hint that must not be discarded with the service hint.
+        "src/main/java/com/example/app/dto/OrderService.java":
+            "package com.example.app.dto;\n"
+            "public record OrderService(String id) {}\n",
+    })
+    try:
+        findings = compute_low_confidence_findings(conn)
+        dtos = _subjects(findings, "Possibly a dto")
+        assert "com.example.app.dto.OrderService" in dtos
+        assert "com.example.app.dto.OrderService" not in _subjects(findings, "Possibly a service")
+    finally:
+        conn.close()
+
+
 def test_reattributed_api_interface_is_not_flagged_as_controller(tmp_path):
     conn = _scan(tmp_path / "repo", {
         "pom.xml": _POM,
